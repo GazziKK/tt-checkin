@@ -1,6 +1,14 @@
 #!/data/data/com.termux/files/usr/bin/sh
-# Викликається termux-job-scheduler. Тік тихий: усе цікаве пише в ~/.tt-checkin/log.txt
-# У cron.out падає те, що в лог не потрапило: stdout тіку і трейсбеки інтерпретатора.
+# Сторож. Викликається termux-job-scheduler раз на 15 хвилин і робить дві речі:
+#
+#   1. піднімає демона, якщо Android його вбив (під тиском пам'яті це рано чи
+#      пізно станеться) — «живий чи ні» визначається спробою взяти його flock;
+#   2. виконує тік як запасний шлях, але лише для пар, чий початок минув понад
+#      5 хвилин: першу спробу лишаємо демону, який влучає в початок пари.
+#      Пізня відмітка краще за жодну.
+#
+# Усе цікаве йде в ~/.tt-checkin/log.txt. У cron.out падає те, що в лог не
+# потрапило: stdout тіку і трейсбеки інтерпретатора.
 cd "$(dirname "$0")" || exit 1
 
 # Каталог має існувати ДО перенаправлення: розписання, поставлене до першого
@@ -9,12 +17,22 @@ DIR="$HOME/.tt-checkin"
 mkdir -p "$DIR" || exit 1
 chmod 700 "$DIR"
 
-OUT="$DIR/cron.out"
-# Рости без межі файл не має: 64 КБ — це з запасом на останні трейсбеки.
-if [ -f "$OUT" ] && [ "$(wc -c < "$OUT")" -gt 65536 ]; then
-    : > "$OUT"
-fi
-: >> "$OUT"
-chmod 600 "$OUT"
+# Рости без межі файли не мають: 64 КБ — це з запасом на останні трейсбеки.
+for OUT in "$DIR/cron.out" "$DIR/daemon.out"; do
+    if [ -f "$OUT" ] && [ "$(wc -c < "$OUT")" -gt 65536 ]; then
+        : > "$OUT"
+    fi
+    : >> "$OUT"
+    chmod 600 "$OUT"
+done
 
-exec python3 tt_checkin.py tick >> "$OUT" 2>&1
+# `daemon --check` пробує взяти daemon.lock неблокуюче і одразу відпускає:
+# вдалося — демон мертвий (лок звільняється смертю процесу, тому PID-файлів і
+# прибирання за вбитим демоном не треба). Wake-lock бере сторож, а не сам
+# демон, щоб демон лишався запускним і на звичайному Linux.
+if ! python3 tt_checkin.py daemon --check >> "$DIR/cron.out" 2>&1; then
+    termux-wake-lock >> "$DIR/cron.out" 2>&1
+    nohup python3 tt_checkin.py daemon >> "$DIR/daemon.out" 2>&1 &
+fi
+
+exec python3 tt_checkin.py tick --late-only >> "$DIR/cron.out" 2>&1
