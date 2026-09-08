@@ -42,7 +42,7 @@
 
 | Призначення | Скрипт | Тіло |
 |---|---|---|
-| Логін | `Avtorization.php` | JSON `{method: 'checkPassword', login, password}` |
+| Логін | `Avtorization.php` | JSON `{method: 'checkPassword', login, password}` — **підтверджено перехопленим запитом** (2026-09-08) |
 | Контекст користувача | `Avtorization.php` | JSON `{method: 'checkAccess', year, semestr}` |
 | Розклад на день | `getQuery.php` | `param=get_listLessonTodayStudent`, `group`, `id_group`, `date`, `year`, `semestr` |
 | Відмітка | `getQuery.php` | `param=get_checkZoom`, `state=s`, `group`, `fioUser`, `idUser`, `numLesson`, `lesson`, `id_lesson`, `type`, `fioTeacher`, `id_fio`, `dateles`, `timebeg`, `timeend` |
@@ -149,6 +149,10 @@ HTTPS — саме так робить сам сайт, MD5 у `Avtorization.js`
 (перевірено: у файлі немає жодного виклику хешування).
 
 Зберігається **лише** cookie `tt_tokin` з відповіді. Пароль на диск не пишеться.
+
+Логін — це корпоративна пошта користувача у форматі `ipz-23d-123@snu.edu.ua`
+(так написано у самій формі входу), пароль видається системою через «нагадати пароль».
+`login` показує цю підказку у промпті, щоб не гадати, що саме вводити.
 
 **Успіх логіну визначається не за формою відповіді `checkPassword`**, а наступним
 викликом `checkAccess`: якщо він повернув `status: "ok"` і непорожню `group` —
