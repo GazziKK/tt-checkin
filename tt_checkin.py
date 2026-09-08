@@ -373,8 +373,13 @@ def parse_day(text: str) -> DaySchedule:
             or len(cells) != SCHEDULE_CELLS
             or not _times_are_valid(attrs)
         ):
-            if cells:
-                skipped += 1  # рядок з даними, який не став парою — це втрата
+            # Втрата — це рядок, який НЕСЕ ознаку пари: `data-id_lesson` стоїть
+            # на <tr>, і зникнення однієї <td> його не прибирає. Рядки без цієї
+            # ознаки структурні — сервер закриває відповідь рядком легенди з
+            # адресами, і він приходить щодня, тому рахувати його як втрату
+            # означало б кричати щодня і привчити читача не вірити попередженню.
+            if "data-id_lesson" in attrs:
+                skipped += 1
             continue
         lessons.append(
             Lesson(
