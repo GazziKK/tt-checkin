@@ -291,3 +291,138 @@ def registration_time(rows: tuple[dict[str, str], ...], fio: str) -> str | None:
         if " ".join(row["fio"].split()).casefold() == wanted:
             return row["time"]
     return None
+
+
+# ─── HTTP ───────────────────────────────────────────────────────────────────
+
+# Два скрипти з різним кодуванням тіла:
+#   php/Avtorization.php — JSON
+#   php/getQuery.php     — application/x-www-form-urlencoded
+
+
+class NetworkError(Exception):
+    """Мережа недоступна або сервер не відповів. Тік має це переживати,
+    а не падати: наступний тік у межах вікна повторить."""
+
+
+class Client:
+    def __init__(self, token: str | None = None, base_url: str = BASE_URL) -> None:
+        self.token = token
+        self._base = base_url.rstrip("/") + "/"
+
+    def _post(self, path: str, body: bytes, content_type: str) -> str:
+        request = urllib.request.Request(self._base + path, data=body, method="POST")
+        request.add_header("Content-Type", content_type)
+        request.add_header("User-Agent", USER_AGENT)
+        request.add_header("Referer", self._base)
+        if self.token:
+            request.add_header("Cookie", f"tt_tokin={self.token}")
+        try:
+            with urllib.request.urlopen(request, timeout=TIMEOUT) as response:
+                self._capture_token(response)
+                return response.read().decode("utf-8", "replace")
+        except urllib.error.HTTPError as error:
+            raise NetworkError(f"HTTP {error.code}") from error
+        except (urllib.error.URLError, OSError) as error:
+            raise NetworkError(str(error)) from error
+
+    def _capture_token(self, response) -> None:
+        """Логін віддає tt_tokin у Set-Cookie."""
+        for header in response.headers.get_all("Set-Cookie") or []:
+            for chunk in header.split(";"):
+                name, _, value = chunk.strip().partition("=")
+                if name == "tt_tokin" and value:
+                    self.token = value
+
+    def _post_json(self, payload: dict) -> str:
+        return self._post(
+            AVTORIZATION,
+            json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            "application/json;charset=utf-8",
+        )
+
+    def _post_form(self, payload: dict) -> str:
+        return self._post(
+            GET_QUERY,
+            urllib.parse.urlencode(payload, encoding="utf-8").encode("utf-8"),
+            "application/x-www-form-urlencoded",
+        )
+
+    def login(self, login: str, password: str) -> None:
+        """Надсилає пароль так, як це робить сама сторінка входу: відкритим
+        текстом у JSON по HTTPS. Успіх перевіряється не тут, а check_access."""
+        self._post_json({"method": "checkPassword", "login": login, "password": password})
+
+    def check_access(self, year: str, semestr: int) -> User | None:
+        """Контекст користувача. None означає «токен не працює або період не той»
+        — розрізняти ці випадки нам не потрібно."""
+        raw = self._post_json({"method": "checkAccess", "year": year, "semestr": semestr})
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(data, dict) or data.get("status") != "ok":
+            return None
+        try:
+            user = json.loads(data.get("user", ""))
+        except (json.JSONDecodeError, TypeError):
+            return None
+        if not isinstance(user, dict) or not user.get("group"):
+            return None
+        return User(
+            fio=str(user.get("fio", "")),
+            id_user=str(user.get("id_user", "")),
+            id_fio=str(user.get("id_fio", "")),
+            group=str(user["group"]),
+            id_group=str(user.get("id_group", "")),
+        )
+
+    def day_schedule(self, user: User, year: str, semestr: int, day: date) -> str:
+        return self._post_form(
+            {
+                "param": "get_listLessonTodayStudent",
+                "group": user.group,
+                "id_group": user.id_group,
+                "date": day.strftime(DATE_FMT),
+                "year": year,
+                "semestr": semestr,
+            }
+        )
+
+    def check_in(self, user: User, lesson: Lesson) -> str:
+        """Поля `lesson` і `type` навмисно несуть Вид і № тижня — саме так
+        робить сайт (див. §2 спеки)."""
+        return self._post_form(
+            {
+                "param": "get_checkZoom",
+                "state": "s",
+                "group": user.group,
+                "fioUser": user.fio,
+                "idUser": user.id_user,
+                "numLesson": lesson.num_lesson,
+                "lesson": lesson.kind,
+                "id_lesson": lesson.id_lesson,
+                "type": lesson.week_numbers,
+                "fioTeacher": lesson.teacher,
+                "id_fio": lesson.id_fio,
+                "dateles": lesson.dateles,
+                "timebeg": lesson.timebeg,
+                "timeend": lesson.timeend,
+            }
+        )
+
+    def journal(self, user: User, lesson: Lesson) -> str:
+        """Увага: тут поле називається `date`, а не `dateles`."""
+        return self._post_form(
+            {
+                "param": "get_listStudent",
+                "group": user.group,
+                "numLesson": lesson.num_lesson,
+                "lesson": lesson.kind,
+                "id_lesson": lesson.id_lesson,
+                "type": lesson.week_numbers,
+                "akademGroup": "1",
+                "date": lesson.dateles,
+                "id_fio": lesson.id_fio,
+            }
+        )
