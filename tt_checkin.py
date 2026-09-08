@@ -154,3 +154,122 @@ def plan_tick(
             to_check_in.append(lesson)
 
     return tuple(to_verify), tuple(to_check_in)
+
+# ─── ПАРСИНГ ────────────────────────────────────────────────────────────────
+
+# Відповіді getQuery.php — не JSON: це рядок, розділений вертикальною рискою,
+# у якому одна з частин містить HTML рядків <tr>.
+#
+#   розклад: [0] день тижня, [1] номер тижня (<=0 — даних немає), [2] рядки
+#   журнал:  [0] рядки, решта не використовується
+#
+# Таблиця розкладу має 9 колонок:
+#   0:№  1:Час  2:Вид  3:Дисципліна  4:moodle  5:№ тижня  6:Викладач
+#   7:Група  8:Аудиторія
+
+
+def _clean(text: str) -> str:
+    """Текст так, як його бачить innerText: <br> уже перетворено в перевід
+    рядка, тут з'їдаються зайві пробіли і порожні рядки."""
+    lines = (" ".join(part.split()) for part in text.split("\n"))
+    return "\n".join(line for line in lines if line)
+
+
+class _RowParser(HTMLParser):
+    """Збирає рядки таблиці: атрибути <tr> плюс текст кожної <td>."""
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.rows: list[tuple[dict[str, str], list[str]]] = []
+        self._attrs: dict[str, str] | None = None
+        self._cells: list[str] | None = None
+        self._buf: list[str] | None = None
+
+    def handle_starttag(self, tag: str, attrs) -> None:
+        if tag == "tr":
+            self._attrs = {name: (value or "") for name, value in attrs}
+            self._cells = []
+        elif tag == "td" and self._cells is not None:
+            self._buf = []
+        elif tag == "br" and self._buf is not None:
+            self._buf.append("\n")
+
+    def handle_startendtag(self, tag: str, attrs) -> None:
+        if tag == "br" and self._buf is not None:
+            self._buf.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        if tag == "td" and self._buf is not None and self._cells is not None:
+            self._cells.append(_clean("".join(self._buf)))
+            self._buf = None
+        elif tag == "tr" and self._cells is not None:
+            self.rows.append((self._attrs or {}, self._cells))
+            self._attrs, self._cells, self._buf = None, None, None
+
+    def handle_data(self, data: str) -> None:
+        if self._buf is not None:
+            self._buf.append(data)
+
+
+def _parse_rows(html: str) -> list[tuple[dict[str, str], list[str]]]:
+    parser = _RowParser()
+    parser.feed(html)
+    parser.close()
+    return parser.rows
+
+
+def parse_day(text: str) -> DaySchedule:
+    parts = text.split("|", 2)
+    if len(parts) < 3:
+        return DaySchedule("", 0, ())
+
+    weekday, raw_week, rows_html = parts
+    try:
+        week_number = int(raw_week.strip())
+    except ValueError:
+        week_number = 0
+    if week_number <= 0:
+        return DaySchedule(weekday.strip(), 0, ())
+
+    lessons: list[Lesson] = []
+    for attrs, cells in _parse_rows(rows_html):
+        if "data-id_lesson" not in attrs or len(cells) < 7:
+            continue
+        lessons.append(
+            Lesson(
+                id_lesson=attrs["data-id_lesson"],
+                num_lesson=cells[0],
+                kind=cells[2],
+                week_numbers=cells[5],
+                teacher=cells[6],
+                id_fio=attrs.get("data-id_fio", ""),
+                group=attrs.get("data-group", ""),
+                dateles=attrs.get("data-dateles", ""),
+                timebeg=attrs.get("data-timebeg", ""),
+                timeend=attrs.get("data-timeend", ""),
+                discipline=attrs.get("data-lesson", ""),
+            )
+        )
+    return DaySchedule(weekday.strip(), week_number, tuple(lessons))
+
+
+JOURNAL_COLUMNS = ("num", "fio", "status", "group", "time", "loads")
+
+
+def parse_journal(text: str) -> tuple[dict[str, str], ...]:
+    rows: list[dict[str, str]] = []
+    for _attrs, cells in _parse_rows(text.split("|")[0]):
+        if len(cells) < len(JOURNAL_COLUMNS):
+            continue
+        rows.append(dict(zip(JOURNAL_COLUMNS, cells)))
+    return tuple(rows)
+
+
+def registration_time(rows: tuple[dict[str, str], ...], fio: str) -> str | None:
+    """Час нашої відмітки в журналі, або None, якщо нас там немає.
+    Порівняння точне (не підрядок), але терпиме до регістру і зайвих пробілів."""
+    wanted = " ".join(fio.split()).casefold()
+    for row in rows:
+        if " ".join(row["fio"].split()).casefold() == wanted:
+            return row["time"]
+    return None
