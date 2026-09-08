@@ -634,3 +634,117 @@ def run_tick(now, client, store, notifier=notify, dry_run: bool = False) -> str:
         notifier("tt-checkin", f"відмітка без підтвердження: пари {stuck}")
     store.log(summary)
     return summary
+
+
+# ─── CLI ────────────────────────────────────────────────────────────────────
+
+LOGIN_HINT = "логін — це корпоративна пошта, наприклад ipz-23d-123@snu.edu.ua"
+
+
+def cmd_login(store: Store) -> int:
+    print(LOGIN_HINT)
+    login = input("логін: ").strip()
+    password = getpass("пароль: ")
+
+    client = Client()
+    try:
+        client.login(login, password)
+    except NetworkError as error:
+        print(f"мережа: {error}", file=sys.stderr)
+        return 1
+    finally:
+        del password
+
+    if not client.token:
+        # Сервер не поставив cookie. Це може бути невірний пароль, а може —
+        # зміна контракту входу; окреме повідомлення потрібне, щоб користувач
+        # не шукав проблему в паролі, коли справа в іншому.
+        print(
+            "сервер не віддав cookie tt_tokin — або логін і пароль невірні, "
+            "або змінився контракт входу",
+            file=sys.stderr,
+        )
+        return 1
+
+    for year, semestr in candidates(date.today()):
+        try:
+            user = client.check_access(year, semestr)
+        except NetworkError as error:
+            print(f"мережа: {error}", file=sys.stderr)
+            return 1
+        if user is None:
+            continue
+        store.write_token(client.token)
+        store.log(f"успішний вхід: {user.group}, період {year} семестр {semestr}")
+        print(
+            f"готово: {user.fio}, група {user.group}, "
+            f"період {year} семестр {semestr}"
+        )
+        return 0
+
+    print(
+        "токен отримано, але жоден навчальний період не підійшов",
+        file=sys.stderr,
+    )
+    return 1
+
+
+def cmd_tick(store: Store, now: datetime, dry_run: bool) -> int:
+    token = store.read_token()
+    if token is None:
+        print("немає токена — спочатку `python3 tt_checkin.py login`", file=sys.stderr)
+        return 1
+    print(run_tick(now, Client(token=token), store, dry_run=dry_run))
+    return 0
+
+
+def cmd_status(store: Store, day: date) -> int:
+    lessons = store.read_plan(day)
+    if not lessons:
+        print(f"плану на цей день немає: {day.isoformat()}")
+        return 0
+
+    state = store.read_state()
+    print(f"розклад на {day.isoformat()}:")
+    for lesson in lessons:
+        current = state.get(lesson.key, PENDING)
+        print(f"  {lesson.num_lesson}. {lesson.timebeg}–{lesson.timeend} "
+              f"{lesson.discipline} [{lesson.kind}] — {current}")
+    return 0
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser(
+        prog="tt_checkin.py", description="автоматична відмітка відвідування"
+    )
+    parser.add_argument("command", choices=["login", "tick", "status"])
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="показати, що зробив би тік, і нічого не відправляти",
+    )
+    parser.add_argument(
+        "--at",
+        metavar="YYYY-MM-DD HH:MM",
+        help="підставити інший час замість поточного (для перевірки логіки вікон)",
+    )
+    args = parser.parse_args(argv)
+
+    now = datetime.now()
+    if args.at:
+        try:
+            now = datetime.strptime(args.at, "%Y-%m-%d %H:%M")
+        except ValueError:
+            print("--at очікує формат 'YYYY-MM-DD HH:MM'", file=sys.stderr)
+            return 2
+
+    store = Store()
+    if args.command == "login":
+        return cmd_login(store)
+    if args.command == "tick":
+        return cmd_tick(store, now, args.dry_run)
+    return cmd_status(store, now.date())
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
