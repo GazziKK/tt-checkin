@@ -155,6 +155,14 @@ def window_is_open(now: datetime, lesson: Lesson) -> bool:
     return beg <= now < end
 
 
+# Журнал сервера пише з лагом: пара, яка зареєструвалась за секунду до
+# `timeend` чи одразу по ньому, могла ще не потрапити у відповідь, знятому
+# рівно в мить закриття вікна. Термінальний `missed` — назавжди (MISSED),
+# тому фінальне читання журналу навмисно відкладене на цей проміжок після
+# `timeend`, щоб не зафіксувати як пропущену пару, яка насправді встигла.
+MISSED_GRACE = timedelta(minutes=3)
+
+
 def plan_tick(
     now: datetime,
     lessons: tuple[Lesson, ...],
@@ -192,7 +200,12 @@ def plan_tick(
             # fail-safe коштує один запит, fail-open — видимий клік.
             (to_check_in if current == PENDING else to_verify).append(lesson)
             continue
-        # Вікно закрилось. Один останній запит до журналу — і пара або `done`
+        if now < end + MISSED_GRACE:
+            # Вікно щойно закрилось, але серверному журналу ще не дали часу
+            # дописати останню пару: чекаємо `MISSED_GRACE`, лишаючи пару в
+            # поточному стані (найчастіше `sent`). Жодного запиту тут немає.
+            continue
+        # Грація минула. Один останній запит до журналу — і пара або `done`
         # (хтось відмітився вручну, або наша відправка все ж зареєструвалась),
         # або `missed` назавжди. `_settle` тут відправити нічого не може:
         # вікно закрите.
@@ -1364,7 +1377,12 @@ DAEMON_RETRY = timedelta(minutes=10)  # пауза, коли розклад уз
 DAEMON_AFTER_MARK = timedelta(minutes=1)
 NEW_DAY_AT = timedelta(minutes=30)  # 00:30 — сервер на цей час уже має новий день
 JITTER_MIN, JITTER_MAX = 30, 120
-LOCK_WAIT = timedelta(minutes=1)  # скільки демон чекає на замок тіку
+# Найгірший тік: `_resolve_access` (три кандидати) + `_relogin` (вхід плюс
+# ще три кандидати) = сім послідовних запитів по `TIMEOUT`=30 с — до ~210 с.
+# `LOCK_WAIT` має цей час перекривати з запасом, інакше демон віддає пару
+# сторожу саме тоді, коли триває перелогін після смерті токена. Не занижуй
+# назад до хвилини — це саме той випадок, який тут рахувався.
+LOCK_WAIT = timedelta(minutes=4)  # скільки демон чекає на замок тіку
 LOCK_POLL = 5.0
 
 
@@ -1486,6 +1504,13 @@ def _daemon_plan(
 ) -> tuple[Lesson, ...] | None:
     handle = _daemon_lock(store, clock, sleeper)
     if handle is None:
+        # Той самий прийом подавлення повторів, що й у `_daemon_schedule` для
+        # «немає мережі»: без нього чужий тік, що тримає замок довше
+        # `LOCK_WAIT`, друкував би однаковий рядок на кожен цикл планування.
+        # Без ЦЬОГО рядка причина «розклад не взято» була б невідома взагалі:
+        # `_daemon_cycle` не відрізняє зайнятий замок від збою мережі.
+        if complain:
+            store.log("демон: замок тіку зайнятий на етапі планування — розклад не взято")
         return None
     try:
         return _daemon_schedule(store, notifier, clock(), complain)
@@ -1718,6 +1743,11 @@ def cmd_daemon(store: Store, check: bool) -> int:
     # мертвий, і замок треба одразу відпустити (закриттям дескриптора), щоб
     # справжній демон міг захопити його сам. PID-файли не потрібні: flock
     # звільняється смертю процесу.
+    #
+    # Нічого не друкуємо в happy path: відповідь — лише код виходу (0 живий,
+    # 1 ні), як і обіцяно в довідці. `tick.sh` викликає це щоцикл сторожа
+    # (до 96 разів на добу) — рядок тут перетворив би `cron.out`, файл для
+    # трейсбеків, на шум.
     try:
         handle = store.open_daemon_lock()
     except OSError as error:
@@ -1725,9 +1755,7 @@ def cmd_daemon(store: Store, check: bool) -> int:
         return 1  # вважаємо мертвим: краще підняти зайвий раз
     try:
         if try_lock(handle):
-            print("демон не працює")
             return 1
-        print("демон живий")
         return 0
     finally:
         handle.close()
@@ -1793,7 +1821,8 @@ def main(argv: list[str] | None = None) -> int:
         "--at",
         metavar="YYYY-MM-DD HH:MM",
         help="підставити інший час замість поточного; з `tick` — тільки разом "
-        "із --dry-run (для перевірки логіки вікон)",
+        "із --dry-run (для перевірки логіки вікон); з `daemon` не приймається "
+        "взагалі",
     )
     args = parser.parse_args(argv)
 
@@ -1803,6 +1832,17 @@ def main(argv: list[str] | None = None) -> int:
             now = datetime.strptime(args.at, "%Y-%m-%d %H:%M")
         except ValueError:
             print("--at очікує формат 'YYYY-MM-DD HH:MM'", file=sys.stderr)
+            return 2
+        if args.command == "daemon":
+            # `daemon` сам читає годинник (`clock=datetime.now`, див.
+            # `run_daemon`) і ніде не бере підставний час: раніше `--at` тут
+            # мовчки нічого не робив, і це виглядало так, ніби прапорець
+            # спрацював.
+            print(
+                "--at не має сенсу для `daemon`: демон завжди бере "
+                "системний час",
+                file=sys.stderr,
+            )
             return 2
         if args.command == "tick" and not args.dry_run:
             # Сервер не перевіряє вікно заняття, тому `tick --at` без
