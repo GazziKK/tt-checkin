@@ -48,8 +48,8 @@ DONE = "done"
 # Службові ключі в `state.json`. Ключ пари починається з дати (`DD.MM.YYYY#…`),
 # тому префікс «#» гарантує, що маркери з парами не переплутаються.
 MARK_DEAD_TOKEN = "#dead-token"
-MARK_EMPTY_DAY = "#empty-day"
 MARK_MISSED = "#missed"
+MARK_PROBED = "#probed"
 
 # ─── МОДЕЛЬ ─────────────────────────────────────────────────────────────────
 
@@ -603,7 +603,6 @@ class Store:
 
 DEAD_TOKEN = "токен не працює — запусти `python3 tt_checkin.py login`"
 NO_NETWORK = "немає мережі — наступний тік повторить"
-NO_LESSONS = "пар на цей день немає"
 
 Notifier = Callable[[str, str], None]
 
@@ -635,8 +634,10 @@ def notify(title: str, message: str) -> None:
 
 def _remember(
     store: Store, state: dict[str, str], key: str, value: str | None
-) -> None:
+) -> bool:
     """Пише стан на диск одразу після зміни (`value=None` — прибрати ключ).
+    Повертає True, якщо стан справді змінився — за цим тік вирішує, чи є
+    про що писати в лог.
 
     Один запис у кінці тіку означав, що тік, який упав після відправки,
     лишав стан порожнім, і наступний тік відправляв ще раз. Збій самого
@@ -645,16 +646,17 @@ def _remember(
     """
     if value is None:
         if key not in state:
-            return
+            return False
         del state[key]
     else:
         if state.get(key) == value:
-            return
+            return False
         state[key] = value
     try:
         store.write_state(state)
     except OSError as error:
         store.log(f"УВАГА: стан не збережено ({key}): {error}")
+    return True
 
 
 def _resolve_access(
@@ -669,6 +671,15 @@ def _resolve_access(
     return None, None, None
 
 
+def _warn_skipped(store: Store, schedule: DaySchedule) -> None:
+    if schedule.skipped:
+        # Часткова втрата пар інакше невидима: `lessons` непорожній.
+        store.log(
+            f"УВАГА: рядків розкладу відкинуто: {schedule.skipped} — "
+            "можливо, змінилася розмітка"
+        )
+
+
 def _load_lessons(
     client: Client,
     store: Store,
@@ -676,62 +687,63 @@ def _load_lessons(
     year: str,
     semestr: int,
     day: date,
+    state: dict[str, str],
 ) -> tuple[Lesson, ...]:
-    """Пари на день: з кешу, інакше з сервера.
+    """Забирає розклад на день з сервера і кешує його. Кеш читає викликач.
 
-    Порожній план **не кешується**, і критерій вибору періоду — непорожній
-    розклад, а не лише checkAccess. На межі семестру checkAccess проходить
-    для періоду, розклад якого порожній; закешований порожній день заморозив
-    би відмітки до вечора, а хибний семестр — до кінця семестру.
+    Порожній день кешується — інакше будильник кожні 15–30 хвилин ходив би
+    в мережу за тим самим «нічого». Але «порожньо» бувають двох різних сортів, і
+    розрізняє їх сам сервер (§2 спеки: `№ тижня <= 0` — даних на цю дату
+    немає):
+
+    - `week_number <= 0` — сервер каже, що на цю дату нічого немає. Кешуємо;
+    - `week_number > 0`, а пар нуль — зламалась розмітка. Не кешуємо, бо
+      наступний тік може застати сервер уже виправленим.
+
+    Порожній **робочий** день — це ще й симптом хибного семестру (той
+    проходить checkAccess, але віддає порожньо щодня), тому решту кандидатів
+    з `candidates()` пробуємо один раз на добу. Вихідні кешуються одразу:
+    порожня субота — це не підозра.
     """
-    cached = store.read_plan(day)
-    if cached:
-        return cached
+    schedule = parse_day(client.day_schedule(user, year, semestr, day))
+    _warn_skipped(store, schedule)
 
-    periods = [(year, semestr)]
-    periods += [item for item in candidates(day) if item not in periods]
+    if schedule.lessons:
+        store.write_plan(day, schedule.lessons)
+        return schedule.lessons
 
-    chosen: DaySchedule | None = None
-    skipped = 0
-    week_number = 0
-    for index, (candidate_year, candidate_semestr) in enumerate(periods):
-        schedule = parse_day(
-            client.day_schedule(user, candidate_year, candidate_semestr, day)
-        )
-        if index == 0:
-            # Про розмітку скаржимось за той період, який пройшов checkAccess
-            # (або за той, з якого взяли розклад). Решта кандидатів — лише
-            # проба, і рядок про кожного з них був би шумом на кожному тіку.
-            skipped, week_number = schedule.skipped, schedule.week_number
-        if schedule.lessons:
-            chosen = schedule
-            skipped = schedule.skipped
-            if index:
-                store.log(
-                    f"розклад узято з періоду {candidate_year}, "
-                    f"семестр {candidate_semestr}"
-                )
-            break
-
-    if skipped:
-        # Часткова втрата пар інакше невидима: `lessons` непорожній.
+    if schedule.week_number > 0:
+        # Сервер знає номер тижня, а жодної пари не розібрано — найпевніше
+        # змінилася розмітка відповіді. Без цього попередження відмова
+        # всього скрипта була б тихою.
         store.log(
-            f"УВАГА: рядків розкладу відкинуто: {skipped} — "
-            "можливо, змінилася розмітка"
+            "УВАГА: відповідь розкладу непорожня, але жодної пари не "
+            "розібрано — можливо, змінився формат"
         )
-    if chosen is None:
-        if week_number > 0:
-            # Сервер знає номер тижня, а жодної пари не розібрано — найпевніше
-            # змінилася розмітка відповіді. Без цього попередження відмова
-            # всього скрипта була б тихою.
-            store.log(
-                "УВАГА: відповідь розкладу непорожня, але жодної пари не "
-                "розібрано — можливо, змінився формат"
-            )
         return ()
 
-    store.write_plan(day, chosen.lessons)
-    return chosen.lessons
+    if day.weekday() < 5 and state.get(MARK_PROBED) != day.isoformat():
+        for other_year, other_semestr in candidates(day):
+            if (other_year, other_semestr) == (year, semestr):
+                continue
+            probe = parse_day(
+                client.day_schedule(user, other_year, other_semestr, day)
+            )
+            _warn_skipped(store, probe)
+            if probe.lessons:
+                store.log(
+                    f"розклад узято з періоду {other_year}, "
+                    f"семестр {other_semestr}"
+                )
+                store.write_plan(day, probe.lessons)
+                return probe.lessons
+        # Маркер ставимо тільки тут: якщо проба знайшла розклад, її треба
+        # мати право повторити (наприклад, коли план видалили руками).
+        _remember(store, state, MARK_PROBED, day.isoformat())
+        store.log("УВАГА: порожній робочий день — можливо, хибний семестр")
+
+    store.write_plan(day, ())
+    return ()
 
 
 def _confirm(client: Client, user: User, lesson: Lesson) -> dict[str, str] | None:
@@ -798,6 +810,35 @@ def run_tick(
         return message
 
 
+def _idle(lessons: tuple[Lesson, ...], dry_run: bool) -> str:
+    """Рядок для тіку, якому нічого робити. У лог не йде: будильник
+    приходить кожні 15–30 хвилин, тобто до ~96 разів на добу, і рядок на тік
+    зробив би `log.txt` — файл, який README радить читати — самим шумом."""
+    return f"{'[dry-run] ' if dry_run else ''}пар: {len(lessons)}; робити нічого"
+
+
+def _report_missed(
+    store: Store,
+    state: dict[str, str],
+    notifier: Notifier,
+    now: datetime,
+    day: date,
+    lessons: tuple[Lesson, ...],
+) -> None:
+    """Пари, чиє вікно закрилось, а `done` так і не сталось. Один рядок у лог
+    і одна нотифікація на добу — телефон, що продрімав ранок, інакше ніде про
+    це не повідомляє. Мережі не потребує: усе вже є в плані і в стані."""
+    missed = [
+        lesson.num_lesson
+        for lesson in lessons
+        if state.get(lesson.key) != DONE and now >= lesson.window()[1]
+    ]
+    if not missed or not _remember(store, state, MARK_MISSED, day.isoformat()):
+        return
+    store.log(f"вікно закрилось без відмітки: пари {missed}")
+    notifier("tt-checkin", f"вікно закрилось без відмітки: пари {missed}")
+
+
 def _run_tick(
     now: datetime,
     client: Client,
@@ -808,6 +849,20 @@ def _run_tick(
     day = now.date()
     state = store.read_state()
 
+    # Спершу локальний план і локальний стан — і лише потім мережа. Будильник
+    # приходить до ~96 разів на добу, і майже кожного разу робити нічого: між
+    # парами, у вихідний і після того, як усі пари `done`, тік має коштувати
+    # нуль запитів.
+    lessons = store.read_plan(day)
+    to_verify: tuple[Lesson, ...] = ()
+    to_check_in: tuple[Lesson, ...] = ()
+    if lessons is not None:
+        to_verify, to_check_in = plan_tick(now, lessons, state)
+        if not to_verify and not to_check_in:
+            _report_missed(store, state, notifier, now, day, lessons)
+            return _idle(lessons, dry_run)
+
+    # Далі без мережі не обійтись: або план ще не забирали, або є що робити.
     try:
         user, year, semestr = _resolve_access(client, day)
     except NetworkError as error:
@@ -815,33 +870,28 @@ def _run_tick(
         return NO_NETWORK
 
     if user is None:
-        store.log(DEAD_TOKEN)
-        # Одна нотифікація на добу, а не на кожен тік: 48 однакових
-        # повідомлень користувач починає змахувати рефлекторно.
-        if state.get(MARK_DEAD_TOKEN) != day.isoformat():
-            _remember(store, state, MARK_DEAD_TOKEN, day.isoformat())
+        # Один рядок і одна нотифікація на добу, а не на кожен тік:
+        # будильник приходить десятки разів, і однакові повідомлення
+        # користувач починає змахувати рефлекторно, а лог — не читати.
+        # Сам рядок «токен не працює» усе одно йде в stdout, тобто в cron.out.
+        if _remember(store, state, MARK_DEAD_TOKEN, day.isoformat()):
+            store.log(DEAD_TOKEN)
             notifier("tt-checkin", DEAD_TOKEN)
         return DEAD_TOKEN
 
     # Токен знову живий — наступна смерть має право нотифікувати.
     _remember(store, state, MARK_DEAD_TOKEN, None)
 
-    try:
-        lessons = _load_lessons(client, store, user, year, semestr, day)
-    except NetworkError as error:
-        store.log(f"{NO_NETWORK} ({error})")
-        return NO_NETWORK
-
-    if not lessons:
-        # Нормальна ситуація (вихідний, канікули). У лог — раз на добу: тік
-        # ходить кожні 30 хвилин, і 48 однакових рядків роблять лог, який
-        # користувачу радять читати, непридатним для читання.
-        if not dry_run and state.get(MARK_EMPTY_DAY) != day.isoformat():
-            _remember(store, state, MARK_EMPTY_DAY, day.isoformat())
-            store.log(NO_LESSONS)
-        return NO_LESSONS
-
-    to_verify, to_check_in = plan_tick(now, lessons, state)
+    if lessons is None:
+        try:
+            lessons = _load_lessons(client, store, user, year, semestr, day, state)
+        except NetworkError as error:
+            store.log(f"{NO_NETWORK} ({error})")
+            return NO_NETWORK
+        to_verify, to_check_in = plan_tick(now, lessons, state)
+        if not to_verify and not to_check_in:
+            _report_missed(store, state, notifier, now, day, lessons)
+            return _idle(lessons, dry_run)
 
     if dry_run:
         summary = (
@@ -855,11 +905,13 @@ def _run_tick(
     done: list[str] = []
     stuck: list[str] = []
     stuck_open: list[str] = []
+    changed = False
 
     # Обидва списки обробляються однаково: `_settle` сам починає з журналу,
     # тому «перевірити» і «відмітити» — це той самий один клік максимум.
     for lesson in to_verify + to_check_in:
         confirmed, sent, error = _settle(client, user, store, now, lesson)
+        changed = changed or sent
         if error is not None:
             if sent:
                 # Відправка пішла, підтвердження — ні. `sent` змусить
@@ -868,35 +920,29 @@ def _run_tick(
             store.log(f"пара {lesson.num_lesson}: мережа впала ({error})")
             continue
         if confirmed:
-            _remember(store, state, lesson.key, DONE)
+            changed = _remember(store, state, lesson.key, DONE) or changed
             done.append(f"{lesson.num_lesson}:{confirmed}")
             continue
-        _remember(store, state, lesson.key, SENT)
+        changed = _remember(store, state, lesson.key, SENT) or changed
         stuck.append(lesson.num_lesson)
         if window_is_open(now, lesson):
             stuck_open.append(lesson.num_lesson)
 
-    missed = [
-        lesson.num_lesson
-        for lesson in lessons
-        if state.get(lesson.key) != DONE and now >= lesson.window()[1]
-    ]
+    _report_missed(store, state, notifier, now, day, lessons)
 
     summary = f"пар: {len(lessons)}; підтверджено: {done or '—'}"
     if stuck:
         summary += f"; без підтвердження: {stuck}"
-    if missed:
-        summary += f"; вікно закрилось без відмітки: {missed}"
-    store.log(summary)
+    if changed:
+        # Пишемо в лог лише те, що справді сталося: відправку, підтвердження
+        # або перехід стану. Пара, яка зависла в `sent` після закритого
+        # вікна, інакше давала б однаковий рядок до кінця дня.
+        store.log(summary)
 
     # Нотифікуємо лише поки є що врятувати: пара з закритим вікном уже
-    # нікуди не подінеться, а повтор кожні 30 хвилин знищує сам канал.
+    # нікуди не подінеться, а повтор на кожному тіку знищує сам канал.
     if stuck_open:
         notifier("tt-checkin", f"відмітка без підтвердження: пари {stuck_open}")
-    if missed and state.get(MARK_MISSED) != day.isoformat():
-        # Телефон, що продрімав ранок, інакше ніде про це не повідомляє.
-        _remember(store, state, MARK_MISSED, day.isoformat())
-        notifier("tt-checkin", f"вікно закрилось без відмітки: пари {missed}")
     return summary
 
 
@@ -999,14 +1045,13 @@ def cmd_tick(store: Store, now: datetime, dry_run: bool) -> int:
 
 def cmd_status(store: Store, day: date) -> int:
     lessons = store.read_plan(day)
+    if lessons is None:
+        print(f"розклад на {day.isoformat()} ще не забирався")
+        return 0
     if not lessons:
-        state = store.read_state()
-        if state.get(MARK_EMPTY_DAY) == day.isoformat():
-            # Порожній план не кешується, тому «пар немає» видно лише за
-            # маркером — інакше це не відрізнити від «розклад не забирався».
-            print(f"розклад на {day.isoformat()} забрано: пар цього дня немає")
-        else:
-            print(f"розклад на {day.isoformat()} ще не забирався")
+        # Порожній план кешується, тому «забрали, пар нуль» відрізняється від
+        # «не забирали» самим фактом наявності файла.
+        print(f"розклад на {day.isoformat()} забрано: пар цього дня немає")
         return 0
 
     state = store.read_state()
