@@ -7,6 +7,7 @@
     python3 tt_checkin.py login
     python3 tt_checkin.py tick
     python3 tt_checkin.py status
+    python3 tt_checkin.py daemon
 """
 
 from __future__ import annotations
@@ -15,17 +16,20 @@ import argparse
 import fcntl
 import json
 import os
+import random
 import subprocess
 import sys
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 from collections.abc import Callable
 from dataclasses import asdict, dataclass
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from getpass import getpass
 from html.parser import HTMLParser
 from pathlib import Path
+from typing import Any
 
 # ─── КОНСТАНТИ ──────────────────────────────────────────────────────────────
 
@@ -41,15 +45,25 @@ USER_AGENT = "Mozilla/5.0 (Linux; Android) tt-checkin"
 
 STATE_ROOT = Path.home() / ".tt-checkin"
 
+# Успішна відмітка нотифікації не дає: чотири повідомлення щодня назавжди
+# перетворюються на шум, а мовчання й означає «усе гаразд». Постав `True` на
+# перший тиждень, поки не звикнеш довіряти автоматиці.
+NOTIFY_ON_SUCCESS = False
+
 PENDING = "pending"
 SENT = "sent"
 DONE = "done"
+# Термінальний стан: вікно закрилось, останній запит до журналу нас там не
+# знайшов. Такої пари більше не торкаємось — інакше вона до півночі коштувала б
+# по запиту на тік, уже нічого не змінюючи.
+MISSED = "missed"
 
 # Службові ключі в `state.json`. Ключ пари починається з дати (`DD.MM.YYYY#…`),
 # тому префікс «#» гарантує, що маркери з парами не переплутаються.
 MARK_DEAD_TOKEN = "#dead-token"
 MARK_MISSED = "#missed"
 MARK_PROBED = "#probed"
+MARK_RELOGIN = "#relogin"
 
 # ─── МОДЕЛЬ ─────────────────────────────────────────────────────────────────
 
@@ -144,33 +158,68 @@ def window_is_open(now: datetime, lesson: Lesson) -> bool:
 def plan_tick(
     now: datetime,
     lessons: tuple[Lesson, ...],
-    state: dict[str, str],
+    state: dict[str, Any],
+    min_age: timedelta = timedelta(0),
 ) -> tuple[tuple[Lesson, ...], tuple[Lesson, ...]]:
     """Що робити на цьому тіку: (перевірити журнал, відмітити).
 
-    `done` не торкаємось узагалі. `sent` завжди йде на перевірку журналом, а не
-    на повторну відправку — щоб не накрутити лічильник «Завантаження».
-    Обидва списки все одно починаються з читання журналу (див. `_settle`);
-    різниця лише в тому, що для `pending` вікно вже перевірене тут.
+    `done` і `missed` не торкаємось узагалі. `sent` завжди йде на перевірку
+    журналом, а не на повторну відправку — щоб не накрутити лічильник
+    «Завантаження». Обидва списки все одно починаються з читання журналу
+    (див. `_settle`), і жодна пара не потрапляє в обидва: одна пара за тік —
+    щонайбільше один клік.
+
+    `min_age` — це запасний шлях сторожа: він працює лише з парами, чий
+    початок минув більше ніж на цей проміжок, і так лишає демону першу спробу.
     """
     to_verify: list[Lesson] = []
     to_check_in: list[Lesson] = []
 
     for lesson in lessons:
         current = state.get(lesson.key, PENDING)
-        if current == DONE:
+        if current in (DONE, MISSED):
             continue
-        if current == PENDING:
+        beg, end = lesson.window()
+        if min_age and now - beg <= min_age:
+            # Пара щойно почалась — це хвилини демона. Умова свідомо не діє при
+            # `min_age=0`, інакше пара точно на `timebeg` випадала б з тіку.
+            continue
+        if now < beg:
+            continue
+        if now < end:
             # Відсутній ключ теж означає `pending` — це нормальний початок дня.
-            if window_is_open(now, lesson):
-                to_check_in.append(lesson)
+            # `sent` і нерозпізнане значення йдуть на перевірку журналом:
+            # fail-safe коштує один запит, fail-open — видимий клік.
+            (to_check_in if current == PENDING else to_verify).append(lesson)
             continue
-        # `sent` або нерозпізнане наявне значення: віддаємо на перевірку
-        # журналом, а не на відправку. Fail-safe коштує один запит,
-        # fail-open — видимий викладачеві клік.
+        # Вікно закрилось. Один останній запит до журналу — і пара або `done`
+        # (хтось відмітився вручну, або наша відправка все ж зареєструвалась),
+        # або `missed` назавжди. `_settle` тут відправити нічого не може:
+        # вікно закрите.
         to_verify.append(lesson)
 
     return tuple(to_verify), tuple(to_check_in)
+
+
+# Порожній кеш робочого дня перечитується: розклад можуть опублікувати з
+# запізненням, і кеш сховав би це до півночі.
+PLAN_EMPTY_TTL = timedelta(hours=4)
+PLAN_RECHECK_FROM = 7
+PLAN_RECHECK_TO = 19
+
+
+def empty_plan_is_stale(now: datetime, mtime: float | None) -> bool:
+    """Чи варто перечитати порожній план дня. Не частіше ніж раз на 4 години і
+    лише в межах 07:00–19:00 робочого дня: вихідні й ніч кешуються на весь
+    день, бо порожня субота — це не підозра, а норма. Ціна — до трьох зайвих
+    запитів на порожній робочий день."""
+    if now.weekday() >= 5 or not PLAN_RECHECK_FROM <= now.hour < PLAN_RECHECK_TO:
+        return False
+    if mtime is None:
+        return False
+    # Час забору беремо з mtime самого файла плану — окремий маркер у стані був
+    # би ще одним джерелом істини про те саме.
+    return datetime.fromtimestamp(mtime) + PLAN_EMPTY_TTL <= now
 
 # ─── ПАРСИНГ ────────────────────────────────────────────────────────────────
 
@@ -537,6 +586,12 @@ class Store:
             tmp.unlink(missing_ok=True)
             raise
 
+    def _mtime(self, name: str) -> float | None:
+        try:
+            return (self.root / name).stat().st_mtime
+        except OSError:
+            return None
+
     def read_token(self) -> str | None:
         path = self.root / "token"
         if not path.exists():
@@ -546,7 +601,46 @@ class Store:
     def write_token(self, value: str) -> None:
         self._write_private("token", value)
 
-    def read_state(self) -> dict[str, str]:
+    def token_mtime(self) -> float | None:
+        """Відступ при мертвому токені привʼязаний саме до mtime: щойно
+        користувач зробить `login`, файл перепишеться, mtime змінюється —
+        і маркер «токен мертвий» сам стає нечинним."""
+        return self._mtime("token")
+
+    def has_credentials(self) -> bool:
+        """Чи є з чим пробувати перелогін. Нечитабельний файл — це «немає»:
+        інакше зламаний JSON вимкнув би і перелогін, і нотифікацію про
+        мертвий токен, тобто поламка стала б зовсім тихою."""
+        return self.read_credentials() is not None
+
+    def read_credentials(self) -> tuple[str, str] | None:
+        """Необовʼязковий файл кредів (його може створити й сам користувач).
+        Назовні йде або пара значень, або None: ні вміст файла, ні текст
+        помилки розбору не мають шансу потрапити в лог чи в нотифікацію."""
+        try:
+            data = json.loads((self.root / "credentials").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return None
+        if not isinstance(data, dict):
+            return None
+        login = str(data.get("login") or "")
+        password = str(data.get("password") or "")
+        if not login or not password:
+            return None
+        return login, password
+
+    def write_credentials(self, login: str, password: str) -> None:
+        self._write_private(
+            "credentials",
+            json.dumps({"login": login, "password": password}, ensure_ascii=False),
+        )
+
+    def credentials_mtime(self) -> float | None:
+        """Лічильник невдалих входів скидається, коли цей mtime змінився:
+        користувач виправив пароль — старі невдачі більше не чинні."""
+        return self._mtime("credentials")
+
+    def read_state(self) -> dict[str, Any]:
         path = self.root / "state.json"
         if not path.exists():
             return {}
@@ -556,7 +650,7 @@ class Store:
             return {}
         return data if isinstance(data, dict) else {}
 
-    def write_state(self, state: dict[str, str]) -> None:
+    def write_state(self, state: dict[str, Any]) -> None:
         self._write_private("state.json", json.dumps(state, ensure_ascii=False, indent=1))
 
     def read_plan(self, day: date) -> tuple[Lesson, ...] | None:
@@ -580,14 +674,28 @@ class Store:
             json.dumps([asdict(item) for item in lessons], ensure_ascii=False, indent=1),
         )
 
-    def open_lock(self):
-        """Файл-замок для `flock`. Тримається відкритим на весь час тіку;
-        закриття дескриптора знімає блокування."""
+    def plan_mtime(self, day: date) -> float | None:
+        return self._mtime(f"plan-{day.isoformat()}.json")
+
+    def _open_lock(self, name: str):
         self._ensure_root()
-        path = self.root / "lock"
+        path = self.root / name
         handle = path.open("a", encoding="utf-8")
         path.chmod(0o600)
         return handle
+
+    def open_lock(self):
+        """Файл-замок від одночасних відміток. Тримається відкритим на весь час
+        тіку; закриття дескриптора знімає блокування. Його бере і тік, і демон:
+        інакше обидва прочитали б той самий стан і клікнули двічі."""
+        return self._open_lock("lock")
+
+    def open_daemon_lock(self):
+        """Замок демона. Живий демон тримає його весь час життя процесу, і
+        зайнятий замок — це і є ознака «демон живий» для сторожа. PID-файл не
+        потрібен: flock звільняється смертю процесу, тому за вбитим демоном
+        нічого прибирати не треба."""
+        return self._open_lock("daemon.lock")
 
     @property
     def log_path(self) -> Path:
@@ -599,10 +707,38 @@ class Store:
             handle.write(f"{datetime.now().isoformat(timespec='seconds')} {message}\n")
         self.log_path.chmod(0o600)
 
+
+def try_lock(handle) -> bool:
+    """Неблокуюче захоплення замку. Перевірено на цільовій системі: зайнятий
+    замок дає `BlockingIOError` (підклас `OSError`), а сам замок звільняється
+    смертю процесу — тому «чи живий процес» = чи вдалось узяти його замок."""
+    try:
+        fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        return False
+    return True
+
 # ─── ОРКЕСТРАЦІЯ ────────────────────────────────────────────────────────────
 
 DEAD_TOKEN = "токен не працює — запусти `python3 tt_checkin.py login`"
 NO_NETWORK = "немає мережі — наступний тік повторить"
+RELOGIN_STOPPED = (
+    "перелогін зі збережених кредів не вдався тричі підряд — перевір "
+    "~/.tt-checkin/credentials і запусти `python3 tt_checkin.py login`"
+)
+
+# Мертвий токен коштував би 3 запити на тік, тобто сотні на добу в нікуди, а
+# полагодити його може лише користувач. Тому маркер із mtime файла токена і
+# спроба не частіше ніж раз на годину — страховка на випадок, що сервер
+# віддавав не-`ok` тимчасово.
+RETRY_DEAD_TOKEN = timedelta(hours=1)
+# Зі сторожем раз на 15 хвилин хибний пароль дав би 96 спроб входу на добу —
+# це шлях до блокування акаунта на боці університету.
+RETRY_RELOGIN = timedelta(hours=1)
+RELOGIN_MAX_FAILS = 3
+# Запасний шлях сторожа працює тільки з парами, чий початок минув понад це:
+# першу спробу лишаємо демону, щоб вони не приходили в ту саму хвилину.
+LATE_FALLBACK = timedelta(minutes=5)
 
 Notifier = Callable[[str, str], None]
 
@@ -633,7 +769,7 @@ def notify(title: str, message: str) -> None:
 
 
 def _remember(
-    store: Store, state: dict[str, str], key: str, value: str | None
+    store: Store, state: dict[str, Any], key: str, value: Any
 ) -> bool:
     """Пише стан на диск одразу після зміни (`value=None` — прибрати ключ).
     Повертає True, якщо стан справді змінився — за цим тік вирішує, чи є
@@ -671,6 +807,195 @@ def _resolve_access(
     return None, None, None
 
 
+def _mark(state: dict[str, Any], key: str) -> dict[str, Any]:
+    """Копія службового маркера-словника. Копія, а не сам словник: `_remember`
+    вирішує, чи писати стан, порівнянням зі збереженим значенням."""
+    value = state.get(key)
+    return dict(value) if isinstance(value, dict) else {}
+
+
+def _moment(raw: Any) -> datetime | None:
+    try:
+        return datetime.fromisoformat(str(raw))
+    except (TypeError, ValueError):
+        return None
+
+
+def _too_soon(now: datetime, raw: Any, interval: timedelta) -> bool:
+    """Чи ще рано для наступної спроби. Час у майбутньому (системний час
+    зсунули назад) відступ не продовжує: краще одна зайва спроба, ніж скрипт,
+    який замовк до кінця семестру."""
+    last = _moment(raw)
+    if last is None:
+        return False
+    return timedelta(0) <= now - last < interval
+
+
+def _fails(mark: dict[str, Any]) -> int:
+    try:
+        return int(mark.get("fails") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _dead_token_backoff(store: Store, state: dict[str, Any], now: datetime) -> bool:
+    """True — токен уже визнано мертвим і пробувати ще рано: тік має вийти
+    БЕЗ жодного запиту. Маркер привʼязаний до mtime обох файлів, з яких можна
+    здобути доступ, тому і `login`, і виправлений вручну файл кредів знімають
+    відступ одразу, а не через годину."""
+    mark = _mark(state, MARK_DEAD_TOKEN)
+    if not mark or mark.get("token_mtime") != store.token_mtime():
+        return False
+    if mark.get("creds_mtime") != store.credentials_mtime():
+        return False
+    return _too_soon(now, mark.get("tried_at"), RETRY_DEAD_TOKEN)
+
+
+def _dead_token_message(store: Store, state: dict[str, Any]) -> str | None:
+    """Що сказати користувачеві про мертвий токен. None — поки що нічого:
+    креди збережені, спроби перелогіну ще не вичерпані, і скрипт має шанс
+    полагодити себе сам протягом години. Одна поламка — одна нотифікація на
+    добу, інакше канал перестають читати."""
+    if not store.has_credentials():
+        return DEAD_TOKEN
+    if _fails(_mark(state, MARK_RELOGIN)) >= RELOGIN_MAX_FAILS:
+        return RELOGIN_STOPPED
+    return None
+
+
+def _note_dead_token(
+    store: Store, state: dict[str, Any], notifier: Notifier, now: datetime
+) -> None:
+    """Токен мертвий (і перелогін не допоміг). Рядок і нотифікація — один раз
+    на добу, а не на кожен тік: однакові повідомлення користувач починає
+    змахувати рефлекторно, а лог — не читати."""
+    mark = _mark(state, MARK_DEAD_TOKEN)
+    day = now.date().isoformat()
+    message = _dead_token_message(store, state)
+    fresh = message is not None and mark.get("notified_day") != day
+    mark["token_mtime"] = store.token_mtime()
+    mark["creds_mtime"] = store.credentials_mtime()
+    mark["tried_at"] = now.isoformat(timespec="seconds")
+    if fresh:
+        mark["notified_day"] = day
+    _remember(store, state, MARK_DEAD_TOKEN, mark)
+    if fresh and message is not None:
+        store.log(message)
+        notifier("tt-checkin", message)
+
+
+def _relogin(
+    client: Client,
+    store: Store,
+    state: dict[str, Any],
+    now: datetime,
+    day: date,
+) -> tuple[User | None, str | None, int | None]:
+    """Токен мертвий, але креди збережені — входимо самі й продовжуємо тік з
+    місця, де спинились. Нотифікація лишається лише на випадок, коли й це не
+    вдалось (її робить `_note_dead_token`).
+
+    Обмеження проти блокування акаунта — найважливіша частина цієї функції:
+    спроба не частіше ніж раз на годину і не більше трьох невдач підряд.
+    Пароль не потрапляє ні в лог, ні в текст помилки, ні в нотифікацію.
+    """
+    credentials = store.read_credentials()
+    if credentials is None:
+        return None, None, None
+
+    mark = _mark(state, MARK_RELOGIN)
+    creds_mtime = store.credentials_mtime()
+    if mark.get("creds_mtime") != creds_mtime:
+        # Користувач виправив пароль — старі невдачі більше не чинні.
+        mark = {"creds_mtime": creds_mtime}
+    fails = _fails(mark)
+    if fails >= RELOGIN_MAX_FAILS:
+        # Здались: далі поводимось так, як з мертвим токеном без кредів —
+        # нуль запитів на вхід. Про це нотифікує `_note_dead_token`, раз на
+        # добу, поки користувач не виправить файл кредів.
+        return None, None, None
+    if _too_soon(now, mark.get("at"), RETRY_RELOGIN):
+        return None, None, None
+
+    login, password = credentials
+    # Спробу записуємо ДО запиту: якщо процес умре посередині, невідомо, чи
+    # запит дійшов до сервера, і краще зачекати годину, ніж стукати в акаунт.
+    mark["at"] = now.isoformat(timespec="seconds")
+    mark["fails"] = fails
+    _remember(store, state, MARK_RELOGIN, mark)
+    try:
+        client.login(login, password)
+        user, year, semestr = _resolve_access(client, day)
+    finally:
+        del password
+
+    if user is None:
+        # Сервер відповів, але доступу немає — це схоже на хибний пароль.
+        # NetworkError сюди не доходить: він летить вище, і лічильник невдач
+        # не рухається, бо з мережевої помилки про пароль нічого не видно.
+        fails += 1
+        mark["fails"] = fails
+        _remember(store, state, MARK_RELOGIN, mark)
+        # Нотифікує не ця гілка, а `_note_dead_token`: поки спроби не
+        # вичерпані, скрипт може полагодити себе сам, і повідомлення «запусти
+        # login» було б передчасним. У лозі лишається кожна спроба.
+        store.log(f"перелогін не вдався: спроба {fails} з {RELOGIN_MAX_FAILS}")
+        return None, None, None
+
+    # Успіх: лічильник невдач у нуль, новий токен одразу на диск — інакше
+    # падіння посеред тіку змусило б входити ще раз. У лозі — тільки факт
+    # і період, ніяких кредів.
+    _remember(store, state, MARK_RELOGIN, {"creds_mtime": creds_mtime})
+    if client.token:
+        try:
+            store.write_token(client.token)
+        except OSError as error:
+            store.log(f"УВАГА: новий токен не збережено: {error}")
+    store.log(f"перелогін зі збережених кредів: період {year} семестр {semestr}")
+    return user, year, semestr
+
+
+def _obtain_access(
+    client: Client,
+    store: Store,
+    state: dict[str, Any],
+    notifier: Notifier,
+    now: datetime,
+    day: date,
+) -> tuple[User | None, str | None, int | None]:
+    """Контекст користувача: відступ при мертвому токені (нуль запитів) →
+    checkAccess → перелогін зі збережених кредів. None означає «доступу немає»,
+    і функція вже сама написала в лог і нотифікувала, якщо було про що."""
+    if _dead_token_backoff(store, state, now):
+        return None, None, None
+    user, year, semestr = _resolve_access(client, day)
+    if user is None:
+        user, year, semestr = _relogin(client, store, state, now, day)
+    if user is None:
+        _note_dead_token(store, state, notifier, now)
+        return None, None, None
+    # Токен знову живий — наступна смерть має право нотифікувати.
+    _remember(store, state, MARK_DEAD_TOKEN, None)
+    return user, year, semestr
+
+
+def _persist_token(store: Store, client: Client) -> None:
+    """Сервер міг оновити cookie посеред тіку; якщо не зберегти, робочий токен
+    викидається, і скрипт починає вимагати `login` без причини. Порівнюємо з
+    тим, що на диску, а не з тим, що читали на початку: перелогін уже міг
+    записати новий токен сам."""
+    if not client.token:
+        return
+    try:
+        if store.read_token() == client.token:
+            return
+        store.write_token(client.token)
+    except OSError as error:
+        store.log(f"УВАГА: новий токен не збережено: {error}")
+        return
+    store.log("токен оновлено сервером")
+
+
 def _warn_skipped(store: Store, schedule: DaySchedule) -> None:
     if schedule.skipped:
         # Часткова втрата пар інакше невидима: `lessons` непорожній.
@@ -680,6 +1005,22 @@ def _warn_skipped(store: Store, schedule: DaySchedule) -> None:
         )
 
 
+def _markup_broke(store: Store, schedule: DaySchedule) -> bool:
+    """`№ тижня > 0`, а пар нуль — це не «порожній день», а зламана розмітка:
+    сервер знає номер тижня, отже дані на дату є. Такий день не кешуємо, бо
+    наступний тік може застати сервер уже виправленим. Перевірка однакова для
+    основного кандидата і для перебраних: інакше перебраний кандидат з битою
+    розміткою виглядав би просто порожнім, і день кешувався б як «можливо,
+    хибний семестр»."""
+    if schedule.week_number <= 0 or schedule.lessons:
+        return False
+    store.log(
+        "УВАГА: відповідь розкладу непорожня, але жодної пари не "
+        "розібрано — можливо, змінився формат"
+    )
+    return True
+
+
 def _load_lessons(
     client: Client,
     store: Store,
@@ -687,7 +1028,7 @@ def _load_lessons(
     year: str,
     semestr: int,
     day: date,
-    state: dict[str, str],
+    state: dict[str, Any],
 ) -> tuple[Lesson, ...]:
     """Забирає розклад на день з сервера і кешує його. Кеш читає викликач.
 
@@ -712,14 +1053,7 @@ def _load_lessons(
         store.write_plan(day, schedule.lessons)
         return schedule.lessons
 
-    if schedule.week_number > 0:
-        # Сервер знає номер тижня, а жодної пари не розібрано — найпевніше
-        # змінилася розмітка відповіді. Без цього попередження відмова
-        # всього скрипта була б тихою.
-        store.log(
-            "УВАГА: відповідь розкладу непорожня, але жодної пари не "
-            "розібрано — можливо, змінився формат"
-        )
+    if _markup_broke(store, schedule):
         return ()
 
     if day.weekday() < 5 and state.get(MARK_PROBED) != day.isoformat():
@@ -730,6 +1064,8 @@ def _load_lessons(
                 client.day_schedule(user, other_year, other_semestr, day)
             )
             _warn_skipped(store, probe)
+            if _markup_broke(store, probe):
+                return ()
             if probe.lessons:
                 store.log(
                     f"розклад узято з періоду {other_year}, "
@@ -772,8 +1108,12 @@ def _settle(
     try:
         row = _confirm(client, user, lesson)
         if row is None and window_is_open(now, lesson):
-            client.check_in(user, lesson)
+            # `sent` ставимо ДО запиту: якщо POST упаде, невідомо, чи він
+            # дійшов, і пара мусить піти в `sent` (§7 спеки). Інакше вона
+            # лишалась би `pending`, а успішна відмітка, що все ж
+            # зареєструвалась, так і лишилась би невідомою.
             sent = True
+            client.check_in(user, lesson)
             row = _confirm(client, user, lesson)
     except NetworkError as error:
         return None, sent, str(error)
@@ -795,11 +1135,18 @@ def run_tick(
     store: Store,
     notifier: Notifier = notify,
     dry_run: bool = False,
+    min_age: timedelta = timedelta(0),
+    refresh: bool = False,
 ) -> str:
     """Один прохід. Ніколи не падає трейсбеком: неочікувана помилка йде
-    в лог і в нотифікацію, бо інакше про неї знав би лише `cron.out`."""
+    в лог і в нотифікацію, бо інакше про неї знав би лише `cron.out`.
+
+    `min_age` — запасний шлях сторожа (тільки пари, чий початок минув понад
+    цей проміжок). `refresh` — розклад береться з мережі, а не з кешу: так
+    робить демон, прокинувшись на ціль, бо пару могли скасувати.
+    """
     try:
-        return _run_tick(now, client, store, notifier, dry_run)
+        return _run_tick(now, client, store, notifier, dry_run, min_age, refresh)
     except Exception as error:  # свідомо широко: тік не має падати тихо
         message = f"неочікувана помилка: {type(error).__name__}: {error}"
         try:
@@ -819,24 +1166,43 @@ def _idle(lessons: tuple[Lesson, ...], dry_run: bool) -> str:
 
 def _report_missed(
     store: Store,
-    state: dict[str, str],
+    state: dict[str, Any],
     notifier: Notifier,
     now: datetime,
     day: date,
     lessons: tuple[Lesson, ...],
 ) -> None:
-    """Пари, чиє вікно закрилось, а `done` так і не сталось. Один рядок у лог
-    і одна нотифікація на добу — телефон, що продрімав ранок, інакше ніде про
-    це не повідомляє. Мережі не потребує: усе вже є в плані і в стані."""
-    missed = [
-        lesson.num_lesson
+    """Пари, чиє вікно закрилось, а `done` так і не сталось. Телефон, що
+    продрімав ранок, інакше ніде про це не повідомляє. Мережі не потребує:
+    усе вже є в плані і в стані.
+
+    Маркер тримає множину вже відзвітованих пар, а не «звітував сьогодні»:
+    з булевим маркером друга пропущена пара за день не потрапляла ні в лог,
+    ні в нотифікацію — саме той канал, для якого цей звіт існує, губив подію.
+    Нотифікація лишається одна на добу (щоб не спамити), лог отримує кожну
+    пару.
+    """
+    mark = _mark(state, MARK_MISSED)
+    if mark.get("day") != day.isoformat():
+        mark = {"day": day.isoformat()}
+    reported = [key for key in mark.get("keys") or [] if isinstance(key, str)]
+    fresh = [
+        lesson
         for lesson in lessons
-        if state.get(lesson.key) != DONE and now >= lesson.window()[1]
+        if state.get(lesson.key) != DONE
+        and now >= lesson.window()[1]
+        and lesson.key not in reported
     ]
-    if not missed or not _remember(store, state, MARK_MISSED, day.isoformat()):
+    if not fresh:
         return
-    store.log(f"вікно закрилось без відмітки: пари {missed}")
-    notifier("tt-checkin", f"вікно закрилось без відмітки: пари {missed}")
+    numbers = [lesson.num_lesson for lesson in fresh]
+    mark["keys"] = reported + [lesson.key for lesson in fresh]
+    notified = mark.get("notified") is True
+    mark["notified"] = True
+    _remember(store, state, MARK_MISSED, mark)
+    store.log(f"вікно закрилось без відмітки: пари {numbers}")
+    if not notified:
+        notifier("tt-checkin", f"вікно закрилось без відмітки: пари {numbers}")
 
 
 def _run_tick(
@@ -845,6 +1211,8 @@ def _run_tick(
     store: Store,
     notifier: Notifier,
     dry_run: bool,
+    min_age: timedelta,
+    refresh: bool,
 ) -> str:
     day = now.date()
     state = store.read_state()
@@ -853,34 +1221,33 @@ def _run_tick(
     # приходить до ~96 разів на добу, і майже кожного разу робити нічого: між
     # парами, у вихідний і після того, як усі пари `done`, тік має коштувати
     # нуль запитів.
-    lessons = store.read_plan(day)
+    lessons = None if refresh else store.read_plan(day)
+    if lessons is not None and not lessons:
+        if empty_plan_is_stale(now, store.plan_mtime(day)):
+            # Порожній кеш робочого дня застарів: розклад могли опублікувати
+            # з запізненням. Перечитуємо — це один додатковий запит, не
+            # більше трьох разів на день.
+            lessons = None
     to_verify: tuple[Lesson, ...] = ()
     to_check_in: tuple[Lesson, ...] = ()
     if lessons is not None:
-        to_verify, to_check_in = plan_tick(now, lessons, state)
+        to_verify, to_check_in = plan_tick(now, lessons, state, min_age)
         if not to_verify and not to_check_in:
             _report_missed(store, state, notifier, now, day, lessons)
             return _idle(lessons, dry_run)
 
     # Далі без мережі не обійтись: або план ще не забирали, або є що робити.
     try:
-        user, year, semestr = _resolve_access(client, day)
+        user, year, semestr = _obtain_access(client, store, state, notifier, now, day)
     except NetworkError as error:
         store.log(f"{NO_NETWORK} ({error})")
         return NO_NETWORK
 
     if user is None:
-        # Один рядок і одна нотифікація на добу, а не на кожен тік:
-        # будильник приходить десятки разів, і однакові повідомлення
-        # користувач починає змахувати рефлекторно, а лог — не читати.
-        # Сам рядок «токен не працює» усе одно йде в stdout, тобто в cron.out.
-        if _remember(store, state, MARK_DEAD_TOKEN, day.isoformat()):
-            store.log(DEAD_TOKEN)
-            notifier("tt-checkin", DEAD_TOKEN)
+        # Рядок і нотифікація вже зроблені в `_obtain_access` — по разу на
+        # добу, а не на кожен тік. Сам рядок «токен не працює» усе одно йде
+        # в stdout, тобто в cron.out.
         return DEAD_TOKEN
-
-    # Токен знову живий — наступна смерть має право нотифікувати.
-    _remember(store, state, MARK_DEAD_TOKEN, None)
 
     if lessons is None:
         try:
@@ -888,7 +1255,7 @@ def _run_tick(
         except NetworkError as error:
             store.log(f"{NO_NETWORK} ({error})")
             return NO_NETWORK
-        to_verify, to_check_in = plan_tick(now, lessons, state)
+        to_verify, to_check_in = plan_tick(now, lessons, state, min_age)
         if not to_verify and not to_check_in:
             _report_missed(store, state, notifier, now, day, lessons)
             return _idle(lessons, dry_run)
@@ -903,8 +1270,10 @@ def _run_tick(
         return summary
 
     done: list[str] = []
+    fresh_done: list[str] = []
     stuck: list[str] = []
     stuck_open: list[str] = []
+    gone: list[str] = []
     changed = False
 
     # Обидва списки обробляються однаково: `_settle` сам починає з журналу,
@@ -914,25 +1283,35 @@ def _run_tick(
         changed = changed or sent
         if error is not None:
             if sent:
-                # Відправка пішла, підтвердження — ні. `sent` змусить
-                # наступний тік спершу зазирнути в журнал.
+                # Відправка пішла (або могла піти), підтвердження — ні. `sent`
+                # змусить наступний тік спершу зазирнути в журнал.
                 _remember(store, state, lesson.key, SENT)
             store.log(f"пара {lesson.num_lesson}: мережа впала ({error})")
             continue
         if confirmed:
-            changed = _remember(store, state, lesson.key, DONE) or changed
+            if _remember(store, state, lesson.key, DONE):
+                changed = True
+                fresh_done.append(f"{lesson.num_lesson}:{confirmed}")
             done.append(f"{lesson.num_lesson}:{confirmed}")
             continue
-        changed = _remember(store, state, lesson.key, SENT) or changed
-        stuck.append(lesson.num_lesson)
         if window_is_open(now, lesson):
+            changed = _remember(store, state, lesson.key, SENT) or changed
+            stuck.append(lesson.num_lesson)
             stuck_open.append(lesson.num_lesson)
+            continue
+        # Вікно закрилось, і останній запит до журналу нас там не знайшов:
+        # термінальний стан. Далі ця пара не коштує жодного запиту — змінити
+        # вже нічого не можна, а видимою вона лишається в `status` і в лозі.
+        changed = _remember(store, state, lesson.key, MISSED) or changed
+        gone.append(lesson.num_lesson)
 
     _report_missed(store, state, notifier, now, day, lessons)
 
     summary = f"пар: {len(lessons)}; підтверджено: {done or '—'}"
     if stuck:
         summary += f"; без підтвердження: {stuck}"
+    if gone:
+        summary += f"; пропущено: {gone}"
     if changed:
         # Пишемо в лог лише те, що справді сталося: відправку, підтвердження
         # або перехід стану. Пара, яка зависла в `sent` після закритого
@@ -943,7 +1322,281 @@ def _run_tick(
     # нікуди не подінеться, а повтор на кожному тіку знищує сам канал.
     if stuck_open:
         notifier("tt-checkin", f"відмітка без підтвердження: пари {stuck_open}")
+    if NOTIFY_ON_SUCCESS and fresh_done:
+        notifier("tt-checkin", f"відмічено: пари {fresh_done}")
     return summary
+
+
+def tick_once(
+    store: Store,
+    now: datetime,
+    notifier: Notifier = notify,
+    dry_run: bool = False,
+    min_age: timedelta = timedelta(0),
+    refresh: bool = False,
+) -> str | None:
+    """Тік із токеном з диска і збереженням токена, який сервер міг оновити.
+    Спільне для команди `tick`, для сторожа і для демона. None означає
+    «токена немає» — з цим може щось зробити лише користувач.
+
+    Замок від одночасних відміток бере викликач: демон тримає його ще й на
+    час перечитування розкладу.
+    """
+    token = store.read_token()
+    if token is None:
+        return None
+    client = Client(token=token)
+    summary = run_tick(now, client, store, notifier, dry_run, min_age, refresh)
+    _persist_token(store, client)
+    return summary
+
+
+# ─── ДЕМОН ──────────────────────────────────────────────────────────────────
+
+# Відмітка має падати на ПОЧАТОК пари: у живому журналі студенти стоять купкою
+# у перші хвилини заняття, і відмітка на 20-й хвилині виглядає в цьому списку
+# окремо. Періодичним тіком у конкретну хвилину влучити не можна в принципі —
+# Android затискає періодичні задачі JobScheduler до >=15 хвилин. Звідси
+# довгоживучий процес, який спить саме до початку кожної пари.
+
+DAEMON_CHUNK = timedelta(minutes=10)  # порція сну
+DAEMON_RETRY = timedelta(minutes=10)  # пауза, коли розклад узяти не вдалось
+DAEMON_AFTER_MARK = timedelta(minutes=1)
+NEW_DAY_AT = timedelta(minutes=30)  # 00:30 — сервер на цей час уже має новий день
+JITTER_MIN, JITTER_MAX = 30, 120
+LOCK_WAIT = timedelta(minutes=1)  # скільки демон чекає на замок тіку
+LOCK_POLL = 5.0
+
+
+def lesson_target(lesson: Lesson) -> datetime:
+    """Ціль демона: початок пари плюс зсув 30–120 секунд. Рівно `09:00:00`
+    щодня місяцями — теж підпис, тому зсув потрібен; але він мусить бути
+    однаковим між перечитуваннями розкладу, інакше ціль стрибала б і демон
+    прокидався б не туди. Тому не `random.random()`, а детермінований вивід
+    з дати й ключа пари — без збереження на диск."""
+    shift = random.Random(f"{lesson.dateles}#{lesson.key}").randint(
+        JITTER_MIN, JITTER_MAX
+    )
+    return lesson.window()[0] + timedelta(seconds=shift)
+
+
+def daemon_targets(
+    now: datetime, lessons: tuple[Lesson, ...], state: dict[str, Any]
+) -> list[tuple[datetime, Lesson]]:
+    """Цілі, які ще в майбутньому, від найближчої. Ціль у минулому демон не
+    переслідує: пари, чий початок уже минув, — це робота сторожа (він бере
+    їх через 5 хвилин після початку). Так демон зі сторожем не приходять до
+    однієї пари в одну хвилину."""
+    targets = [
+        (lesson_target(lesson), lesson)
+        for lesson in lessons
+        if state.get(lesson.key, PENDING) not in (DONE, MISSED)
+    ]
+    return sorted(
+        (item for item in targets if item[0] > now), key=lambda item: item[0]
+    )
+
+
+def _next_day_start(now: datetime) -> datetime:
+    """00:30 наступного дня. Не 00:00: сервер має встигнути віддати новий
+    день, і перші хвилини доби лишаються тіку."""
+    midnight = datetime.combine(now.date() + timedelta(days=1), datetime.min.time())
+    return midnight + NEW_DAY_AT
+
+
+def _sleep_until(
+    clock: Callable[[], datetime],
+    sleeper: Callable[[float], None],
+    until: datetime,
+) -> None:
+    """Сон порціями по 10 хвилин, із перечитуванням годинника щоразу. Одне
+    `sleep()` на всю дистанцію не пережило б ні стрибка системного часу, ні
+    зміни дати: телефон, який прокинувся з іншим часом, спав би далі до
+    вчорашньої цілі."""
+    while True:
+        left = (until - clock()).total_seconds()
+        if left <= 0:
+            return
+        sleeper(min(left, DAEMON_CHUNK.total_seconds()))
+
+
+def _wait_lock(
+    handle,
+    clock: Callable[[], datetime],
+    sleeper: Callable[[float], None],
+    deadline: datetime,
+) -> bool:
+    """Замок з обмеженим очікуванням. Блокуючий `flock` зупинив би демона на
+    невизначений час, якби чужий тік завис у мережі, — а демон, який не
+    прокинувся, це пропущений семестр."""
+    while True:
+        if try_lock(handle):
+            return True
+        if clock() >= deadline:
+            return False
+        sleeper(LOCK_POLL)
+
+
+def _daemon_lock(
+    store: Store,
+    clock: Callable[[], datetime],
+    sleeper: Callable[[float], None],
+):
+    """Замок від одночасних відміток на час роботи демона з мережею і станом.
+    Демон і сторож інакше прочитали б той самий стан і клікнули двічі."""
+    handle = store.open_lock()
+    if _wait_lock(handle, clock, sleeper, clock() + LOCK_WAIT):
+        return handle
+    handle.close()
+    return None
+
+
+def _daemon_schedule(
+    store: Store, notifier: Notifier, now: datetime, complain: bool
+) -> tuple[Lesson, ...] | None:
+    """Розклад на сьогодні з мережі, а не з кешу: розклад живий — бувають
+    заміни, скасування і додані пари, а демон планує на весь день уперед.
+    Кеш заодно оновлюється, тому свіжий план дістається й сторожеві.
+    None означає «не вдалось» (немає токена, токен мертвий або немає мережі)."""
+    token = store.read_token()
+    if token is None:
+        return None
+    client = Client(token=token)
+    state = store.read_state()
+    day = now.date()
+    try:
+        user, year, semestr = _obtain_access(client, store, state, notifier, now, day)
+        if user is None:
+            return None
+        return _load_lessons(client, store, user, year, semestr, day, state)
+    except NetworkError as error:
+        if complain:
+            store.log(f"{NO_NETWORK} (демон: {error})")
+        return None
+    finally:
+        _persist_token(store, client)
+
+
+def _daemon_plan(
+    store: Store,
+    notifier: Notifier,
+    clock: Callable[[], datetime],
+    sleeper: Callable[[float], None],
+    complain: bool,
+) -> tuple[Lesson, ...] | None:
+    handle = _daemon_lock(store, clock, sleeper)
+    if handle is None:
+        return None
+    try:
+        return _daemon_schedule(store, notifier, clock(), complain)
+    finally:
+        handle.close()  # закриття дескриптора знімає flock
+
+
+def _daemon_mark(
+    store: Store,
+    notifier: Notifier,
+    clock: Callable[[], datetime],
+    sleeper: Callable[[float], None],
+) -> None:
+    """Ціль настала. Розклад перечитується ще раз (пару могли скасувати, і
+    тоді її не існує в свіжому плані), а відмічається тією самою логікою, що
+    й у тіку: журнал перед відправкою, одна відправка, підтвердження."""
+    handle = _daemon_lock(store, clock, sleeper)
+    if handle is None:
+        store.log("демон: замок тіку зайнятий — відмітку робить сторож")
+        return
+    try:
+        summary = tick_once(store, clock(), notifier, refresh=True)
+    finally:
+        handle.close()
+    if summary is not None:
+        print(summary, flush=True)
+
+
+def _daemon_cycle(
+    store: Store,
+    notifier: Notifier,
+    clock: Callable[[], datetime],
+    sleeper: Callable[[float], None],
+    complain: bool,
+) -> bool:
+    """Один прохід циклу; повертає, чи вдалось узяти розклад. Кожна гілка або
+    спить, або відмічається і спить — прокрутитись без сну цикл не може."""
+    lessons = _daemon_plan(store, notifier, clock, sleeper, complain)
+    if lessons is None:
+        # Причина вже в лозі (або це мертвий токен, про який звітують раз на
+        # добу). Сторож тим часом лишається запасним шляхом.
+        _sleep_until(clock, sleeper, clock() + DAEMON_RETRY)
+        return False
+    targets = daemon_targets(clock(), lessons, store.read_state())
+    if not targets:
+        _sleep_until(clock, sleeper, _next_day_start(clock()))
+        return True
+    _sleep_until(clock, sleeper, targets[0][0])
+    _daemon_mark(store, notifier, clock, sleeper)
+    # Хвилина після відмітки: якби системний час зсунули назад, та сама ціль
+    # знову виявилась би в майбутньому, і цикл крутився б без паузи.
+    _sleep_until(clock, sleeper, clock() + DAEMON_AFTER_MARK)
+    return True
+
+
+def _daemon_loop(
+    store: Store,
+    notifier: Notifier,
+    clock: Callable[[], datetime],
+    sleeper: Callable[[float], None],
+) -> None:
+    # `complain` гасить повтори: доба без мережі інакше дала б 144 однакові
+    # рядки в тому файлі, який README радить читати. Перша невдача серії йде
+    # в лог, решта — ні, поки розклад знову не вдасться взяти.
+    complain = True
+    while True:
+        try:
+            complain = _daemon_cycle(store, notifier, clock, sleeper, complain)
+        except Exception as error:  # свідомо широко: демон не має вмирати
+            try:
+                store.log(
+                    f"демон: неочікувана помилка: {type(error).__name__}: {error}"
+                )
+            except OSError:
+                pass
+            _sleep_until(clock, sleeper, clock() + DAEMON_RETRY)
+
+
+def run_daemon(
+    store: Store,
+    notifier: Notifier = notify,
+    clock: Callable[[], datetime] = datetime.now,
+    sleeper: Callable[[float], None] = time.sleep,
+) -> int:
+    """Демон точного часу. `clock` і `sleeper` — параметри, щоб цикл можна
+    було прогнати без очікування реального часу.
+
+    `termux-wake-lock` демон не бере сам: це робить завантажувальний скрипт,
+    щоб демон лишався запускним і на звичайному Linux.
+    """
+    try:
+        handle = store.open_daemon_lock()
+    except OSError as error:
+        print(f"не вдалося відкрити файл-замок демона: {error}", file=sys.stderr)
+        return 1
+    if not try_lock(handle):
+        # Замок зайнятий — демон уже працює. Виходимо з нулем: для сторожа це
+        # нормальний стан речей, а не поламка.
+        handle.close()
+        print("демон уже працює")
+        return 0
+    # Замок тримається до смерті процесу: `handle` живе до кінця функції, а
+    # flock звільняється смертю процесу і без `close()`.
+    store.log("демон запущено")
+    if store.read_token() is None:
+        store.log("демон: немає токена — спочатку `python3 tt_checkin.py login`")
+    try:
+        _daemon_loop(store, notifier, clock, sleeper)
+    except KeyboardInterrupt:
+        store.log("демон зупинено")
+    return 0
 
 
 # ─── CLI ────────────────────────────────────────────────────────────────────
@@ -951,7 +1604,13 @@ def _run_tick(
 LOGIN_HINT = "логін — це корпоративна пошта, наприклад ipz-23d-123@snu.edu.ua"
 
 
-def cmd_login(store: Store) -> int:
+CREDENTIALS_SAVED = (
+    "креди збережено в ~/.tt-checkin/credentials (0600): скрипт зможе "
+    "перелогінитись сам. Токен можна відкликати виходом з акаунта, пароль — ні"
+)
+
+
+def cmd_login(store: Store, remember: bool = False) -> int:
     print(LOGIN_HINT)
     try:
         login = input("логін: ").strip()
@@ -964,39 +1623,52 @@ def cmd_login(store: Store) -> int:
 
     client = Client()
     try:
-        client.login(login, password)
-    except NetworkError as error:
-        print(f"мережа: {error}", file=sys.stderr)
-        return 1
-    finally:
-        del password
-
-    if not client.token:
-        # Сервер не поставив cookie. Це може бути невірний пароль, а може —
-        # зміна контракту входу; окреме повідомлення потрібне, щоб користувач
-        # не шукав проблему в паролі, коли справа в іншому.
-        print(
-            "сервер не віддав cookie tt_tokin — або логін і пароль невірні, "
-            "або змінився контракт входу",
-            file=sys.stderr,
-        )
-        return 1
-
-    for year, semestr in candidates(date.today()):
         try:
-            user = client.check_access(year, semestr)
+            client.login(login, password)
         except NetworkError as error:
             print(f"мережа: {error}", file=sys.stderr)
             return 1
-        if user is None:
-            continue
-        store.write_token(client.token)
-        store.log(f"успішний вхід: {user.group}, період {year} семестр {semestr}")
-        print(
-            f"готово: {user.fio}, група {user.group}, "
-            f"період {year} семестр {semestr}"
-        )
-        return 0
+
+        if not client.token:
+            # Сервер не поставив cookie. Це може бути невірний пароль, а може —
+            # зміна контракту входу; окреме повідомлення потрібне, щоб
+            # користувач не шукав проблему в паролі, коли справа в іншому.
+            print(
+                "сервер не віддав cookie tt_tokin — або логін і пароль невірні, "
+                "або змінився контракт входу",
+                file=sys.stderr,
+            )
+            return 1
+
+        for year, semestr in candidates(date.today()):
+            try:
+                user = client.check_access(year, semestr)
+            except NetworkError as error:
+                print(f"мережа: {error}", file=sys.stderr)
+                return 1
+            if user is None:
+                continue
+            store.write_token(client.token)
+            if remember:
+                # Креди пишемо тільки після підтвердженого входу: збережений
+                # хибний пароль автоматика потім била б об акаунт.
+                try:
+                    store.write_credentials(login, password)
+                except OSError as error:
+                    print(
+                        f"токен збережено, але креди не записались: {error}",
+                        file=sys.stderr,
+                    )
+                else:
+                    print(CREDENTIALS_SAVED)
+            store.log(f"успішний вхід: {user.group}, період {year} семестр {semestr}")
+            print(
+                f"готово: {user.fio}, група {user.group}, "
+                f"період {year} семестр {semestr}"
+            )
+            return 0
+    finally:
+        del password
 
     print(
         "токен отримано, але жоден навчальний період не підійшов",
@@ -1005,9 +1677,10 @@ def cmd_login(store: Store) -> int:
     return 1
 
 
-def cmd_tick(store: Store, now: datetime, dry_run: bool) -> int:
-    token = store.read_token()
-    if token is None:
+def cmd_tick(
+    store: Store, now: datetime, dry_run: bool, min_age: timedelta = timedelta(0)
+) -> int:
+    if store.read_token() is None:
         print("немає токена — спочатку `python3 tt_checkin.py login`", file=sys.stderr)
         return 1
 
@@ -1018,29 +1691,46 @@ def cmd_tick(store: Store, now: datetime, dry_run: bool) -> int:
         return 1
 
     try:
-        try:
-            fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        except OSError:
+        if not try_lock(handle):
             # Два тіки, що перетнулись (а README сам радить запускати `tick`
             # руками), обидва прочитали б той самий стан і обидва відправили
-            # б — це «Завантаження» 2. Другий тік просто йде геть.
+            # б — це «Завантаження» 2. Той самий замок бере й демон.
             store.log("тік уже виконується — вихід")
             return 0
 
-        client = Client(token=token)
-        print(run_tick(now, client, store, dry_run=dry_run))
-        if client.token and client.token != token:
-            # Сервер міг оновити cookie. Якщо не зберегти, робочий токен
-            # викидається, і скрипт починає вимагати `login` без причини.
-            try:
-                store.write_token(client.token)
-                store.log("токен оновлено сервером")
-            except OSError as error:
-                # Тік уже відпрацював — про збій треба сказати, а не впасти.
-                store.log(f"УВАГА: новий токен не збережено: {error}")
+        summary = tick_once(store, now, dry_run=dry_run, min_age=min_age)
+        if summary is None:
+            print(
+                "немає токена — спочатку `python3 tt_checkin.py login`",
+                file=sys.stderr,
+            )
+            return 1
+        print(summary)
         return 0
     finally:
         handle.close()  # закриття дескриптора знімає flock
+
+
+def cmd_daemon(store: Store, check: bool) -> int:
+    if not check:
+        return run_daemon(store)
+    # «Чи живий демон» = спроба взяти його замок неблокуюче. Вдалося — демон
+    # мертвий, і замок треба одразу відпустити (закриттям дескриптора), щоб
+    # справжній демон міг захопити його сам. PID-файли не потрібні: flock
+    # звільняється смертю процесу.
+    try:
+        handle = store.open_daemon_lock()
+    except OSError as error:
+        print(f"не вдалося відкрити файл-замок демона: {error}", file=sys.stderr)
+        return 1  # вважаємо мертвим: краще підняти зайвий раз
+    try:
+        if try_lock(handle):
+            print("демон не працює")
+            return 1
+        print("демон живий")
+        return 0
+    finally:
+        handle.close()
 
 
 def cmd_status(store: Store, day: date) -> int:
@@ -1060,6 +1750,14 @@ def cmd_status(store: Store, day: date) -> int:
         current = state.get(lesson.key, PENDING)
         print(f"  {lesson.num_lesson}. {lesson.timebeg}–{lesson.timeend} "
               f"{lesson.discipline} [{lesson.kind}] — {current}")
+    missed = [
+        lesson.num_lesson for lesson in lessons if state.get(lesson.key) == MISSED
+    ]
+    if missed:
+        # Окремий рядок, а не лише стан у списку: це саме той рядок, який
+        # користувач мусить побачити — пара, яку автоматика не змогла
+        # відмітити, і вікно вже закрите.
+        print(f"автоматика не змогла відмітити: пари {missed}")
     return 0
 
 
@@ -1067,11 +1765,29 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
         prog="tt_checkin.py", description="автоматична відмітка відвідування"
     )
-    parser.add_argument("command", choices=["login", "tick", "status"])
+    parser.add_argument("command", choices=["login", "tick", "status", "daemon"])
     parser.add_argument(
         "--dry-run",
         action="store_true",
         help="показати, що зробив би тік, і нічого не відправляти",
+    )
+    parser.add_argument(
+        "--remember",
+        action="store_true",
+        help="з `login`: зберегти логін і пароль у ~/.tt-checkin/credentials, "
+        "щоб скрипт міг перелогінитись сам, коли токен помре",
+    )
+    parser.add_argument(
+        "--late-only",
+        action="store_true",
+        help="з `tick`: тільки пари, чий початок минув понад 5 хвилин "
+        "(запасний шлях сторожа — першу спробу лишаємо демону)",
+    )
+    parser.add_argument(
+        "--check",
+        action="store_true",
+        help="з `daemon`: чи живий демон (код 0 — живий, 1 — ні), і нічого "
+        "не запускати",
     )
     parser.add_argument(
         "--at",
@@ -1100,9 +1816,12 @@ def main(argv: list[str] | None = None) -> int:
 
     store = Store()
     if args.command == "login":
-        return cmd_login(store)
+        return cmd_login(store, args.remember)
+    if args.command == "daemon":
+        return cmd_daemon(store, args.check)
     if args.command == "tick":
-        return cmd_tick(store, now, args.dry_run)
+        min_age = LATE_FALLBACK if args.late_only else timedelta(0)
+        return cmd_tick(store, now, args.dry_run, min_age)
     return cmd_status(store, now.date())
 
 
