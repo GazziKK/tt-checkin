@@ -426,3 +426,211 @@ class Client:
                 "id_fio": lesson.id_fio,
             }
         )
+
+# ─── СХОВИЩЕ ────────────────────────────────────────────────────────────────
+
+# Каталог 0700, файли 0600. Пароль тут не зберігається взагалі,
+# токен у лог не потрапляє ніколи.
+
+
+class Store:
+    def __init__(self, root: Path = STATE_ROOT) -> None:
+        self.root = Path(root)
+
+    def _ensure_root(self) -> None:
+        self.root.mkdir(mode=0o700, parents=True, exist_ok=True)
+        self.root.chmod(0o700)
+
+    def _write_private(self, name: str, content: str) -> None:
+        self._ensure_root()
+        path = self.root / name
+        path.write_text(content, encoding="utf-8")
+        path.chmod(0o600)
+
+    def read_token(self) -> str | None:
+        path = self.root / "token"
+        if not path.exists():
+            return None
+        return path.read_text(encoding="utf-8").strip() or None
+
+    def write_token(self, value: str) -> None:
+        self._write_private("token", value)
+
+    def read_state(self) -> dict[str, str]:
+        path = self.root / "state.json"
+        if not path.exists():
+            return {}
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return {}
+        return data if isinstance(data, dict) else {}
+
+    def write_state(self, state: dict[str, str]) -> None:
+        self._write_private("state.json", json.dumps(state, ensure_ascii=False, indent=1))
+
+    def read_plan(self, day: date) -> tuple[Lesson, ...] | None:
+        path = self.root / f"plan-{day.isoformat()}.json"
+        if not path.exists():
+            return None
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(data, list):
+            return None
+        try:
+            return tuple(Lesson(**item) for item in data)
+        except TypeError:
+            return None
+
+    def write_plan(self, day: date, lessons: tuple[Lesson, ...]) -> None:
+        self._write_private(
+            f"plan-{day.isoformat()}.json",
+            json.dumps([asdict(item) for item in lessons], ensure_ascii=False, indent=1),
+        )
+
+    @property
+    def log_path(self) -> Path:
+        return self.root / "log.txt"
+
+    def log(self, message: str) -> None:
+        self._ensure_root()
+        with self.log_path.open("a", encoding="utf-8") as handle:
+            handle.write(f"{datetime.now().isoformat(timespec='seconds')} {message}\n")
+        self.log_path.chmod(0o600)
+
+# ─── ОРКЕСТРАЦІЯ ────────────────────────────────────────────────────────────
+
+DEAD_TOKEN = "токен не працює — запусти `python3 tt_checkin.py login`"
+NO_NETWORK = "немає мережі — наступний тік повторить"
+
+
+def notify(title: str, message: str) -> None:
+    """Нотифікація через Termux API. Не на телефоні — тихо нічого не робимо."""
+    try:
+        subprocess.run(
+            ["termux-notification", "--title", title, "--content", message],
+            check=False,
+            capture_output=True,
+            timeout=15,
+        )
+    except (FileNotFoundError, subprocess.SubprocessError):
+        pass
+
+
+def _resolve_access(client: Client, day: date):
+    for year, semestr in candidates(day):
+        user = client.check_access(year, semestr)
+        if user is not None:
+            return user, year, semestr
+    return None, None, None
+
+
+def _load_lessons(client, store, user, year, semestr, day) -> tuple[Lesson, ...]:
+    cached = store.read_plan(day)
+    if cached is not None:
+        return cached
+    schedule = parse_day(client.day_schedule(user, year, semestr, day))
+    if schedule.week_number > 0 and not schedule.lessons:
+        # Сервер знає номер тижня, а жодної пари не розібрано — найпевніше
+        # змінилася розмітка відповіді. Без цього попередження відмова
+        # всього скрипта була б тихою.
+        store.log(
+            "УВАГА: відповідь розкладу непорожня, але жодної пари не "
+            "розібрано — можливо, змінився формат"
+        )
+    store.write_plan(day, schedule.lessons)
+    return schedule.lessons
+
+
+def _confirm(client: Client, user: User, lesson: Lesson) -> str | None:
+    return registration_time(parse_journal(client.journal(user, lesson)), user.fio)
+
+
+def _check_in(client: Client, user: User, lesson: Lesson) -> str | None:
+    """Відмітка з підтвердженням. Не більше MAX_ATTEMPTS спроб за тік, щоб
+    зламаний сервер не накрутив «Завантаження»."""
+    for _ in range(MAX_ATTEMPTS):
+        client.check_in(user, lesson)
+        confirmed = _confirm(client, user, lesson)
+        if confirmed:
+            return confirmed
+    return None
+
+
+def run_tick(now, client, store, notifier=notify, dry_run: bool = False) -> str:
+    day = now.date()
+
+    try:
+        user, year, semestr = _resolve_access(client, day)
+    except NetworkError as error:
+        store.log(f"{NO_NETWORK} ({error})")
+        return NO_NETWORK
+
+    if user is None:
+        store.log(DEAD_TOKEN)
+        notifier("tt-checkin", DEAD_TOKEN)
+        return DEAD_TOKEN
+
+    try:
+        lessons = _load_lessons(client, store, user, year, semestr, day)
+    except NetworkError as error:
+        store.log(f"{NO_NETWORK} ({error})")
+        return NO_NETWORK
+
+    state = store.read_state()
+    to_verify, to_check_in = plan_tick(now, lessons, state)
+
+    if dry_run:
+        summary = (
+            f"[dry-run] пар: {len(lessons)}; відмітив би: "
+            f"{[item.num_lesson for item in to_check_in] or '—'}; "
+            f"перевірив би: {[item.num_lesson for item in to_verify] or '—'}"
+        )
+        store.log(summary)
+        return summary
+
+    done: list[str] = []
+    stuck: list[str] = []
+
+    for lesson in to_verify:
+        try:
+            confirmed = _confirm(client, user, lesson)
+            if not confirmed and window_is_open(now, lesson):
+                # У журналі нас немає, а вікно ще відкрите — значить попередня
+                # відправка не дійшла. Надсилаємо ще раз.
+                confirmed = _check_in(client, user, lesson)
+        except NetworkError as error:
+            store.log(f"пара {lesson.num_lesson}: мережа впала ({error})")
+            continue
+        if confirmed:
+            state[lesson.key] = DONE
+            done.append(f"{lesson.num_lesson}:{confirmed}")
+        else:
+            stuck.append(lesson.num_lesson)
+
+    for lesson in to_check_in:
+        try:
+            confirmed = _check_in(client, user, lesson)
+        except NetworkError as error:
+            # Невідомо, чи запит дійшов, тому `sent`: наступний тік спершу
+            # подивиться в журнал, а не надішле вдруге.
+            state[lesson.key] = SENT
+            store.log(f"пара {lesson.num_lesson}: мережа впала ({error})")
+            continue
+        if confirmed:
+            state[lesson.key] = DONE
+            done.append(f"{lesson.num_lesson}:{confirmed}")
+        else:
+            state[lesson.key] = SENT
+            stuck.append(lesson.num_lesson)
+
+    store.write_state(state)
+
+    summary = f"пар: {len(lessons)}; підтверджено: {done or '—'}"
+    if stuck:
+        summary += f"; без підтвердження: {stuck}"
+        notifier("tt-checkin", f"відмітка без підтвердження: пари {stuck}")
+    store.log(summary)
+    return summary
