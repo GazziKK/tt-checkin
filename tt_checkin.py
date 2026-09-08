@@ -176,7 +176,10 @@ def _clean(text: str) -> str:
 
 
 class _RowParser(HTMLParser):
-    """Збирає рядки таблиці: атрибути <tr> плюс текст кожної <td>."""
+    """Збирає рядки таблиці: атрибути <tr> плюс текст кожної <td>.
+    Парсер не покладається на добре сформований HTML: новий тег <tr>/<td>
+    неявно закриває попередній, незакритий останній рядок теж потрапляє
+    в результат."""
 
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
@@ -185,11 +188,24 @@ class _RowParser(HTMLParser):
         self._cells: list[str] | None = None
         self._buf: list[str] | None = None
 
+    def _flush_cell(self) -> None:
+        if self._buf is not None and self._cells is not None:
+            self._cells.append(_clean("".join(self._buf)))
+        self._buf = None
+
+    def _flush_row(self) -> None:
+        self._flush_cell()
+        if self._cells is not None:
+            self.rows.append((self._attrs or {}, self._cells))
+        self._attrs, self._cells = None, None
+
     def handle_starttag(self, tag: str, attrs) -> None:
         if tag == "tr":
+            self._flush_row()  # HTML5: новий <tr> неявно закриває попередній
             self._attrs = {name: (value or "") for name, value in attrs}
             self._cells = []
         elif tag == "td" and self._cells is not None:
+            self._flush_cell()  # новий <td> неявно закриває попередній
             self._buf = []
         elif tag == "br" and self._buf is not None:
             self._buf.append("\n")
@@ -199,16 +215,18 @@ class _RowParser(HTMLParser):
             self._buf.append("\n")
 
     def handle_endtag(self, tag: str) -> None:
-        if tag == "td" and self._buf is not None and self._cells is not None:
-            self._cells.append(_clean("".join(self._buf)))
-            self._buf = None
-        elif tag == "tr" and self._cells is not None:
-            self.rows.append((self._attrs or {}, self._cells))
-            self._attrs, self._cells, self._buf = None, None, None
+        if tag == "td":
+            self._flush_cell()
+        elif tag == "tr":
+            self._flush_row()
 
     def handle_data(self, data: str) -> None:
         if self._buf is not None:
             self._buf.append(data)
+
+    def close(self) -> None:
+        super().close()
+        self._flush_row()  # незакритий останній рядок теж має потрапити в результат
 
 
 def _parse_rows(html: str) -> list[tuple[dict[str, str], list[str]]]:
