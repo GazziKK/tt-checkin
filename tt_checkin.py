@@ -568,6 +568,9 @@ class Client:
                 "akademGroup": "1",
                 "date": lesson.dateles,
                 "id_fio": lesson.id_fio,
+                # Без `idUser` getQuery.php з жовтня 2026 падає з PHP Fatal
+                # error замість журналу — так само, як це надсилає сайт.
+                "idUser": user.id_user,
             }
         )
 
@@ -1100,8 +1103,14 @@ def _load_lessons(
     return ()
 
 
-def _confirm(client: Client, user: User, lesson: Lesson) -> dict[str, str] | None:
-    return registration_row(parse_journal(client.journal(user, lesson)), user.fio)
+def _confirm(
+    client: Client, user: User, lesson: Lesson
+) -> tuple[dict[str, str] | None, bool]:
+    """(наш рядок журналу, чи журнал узагалі прочитався). Журнал без жодного
+    рядка — це або порожня пара, або відповідь, яку ми не розуміємо (PHP
+    Fatal error, новий формат); розрізнити їх ми не можемо."""
+    rows = parse_journal(client.journal(user, lesson))
+    return registration_row(rows, user.fio), bool(rows)
 
 
 def _settle(
@@ -1110,6 +1119,7 @@ def _settle(
     store: Store,
     now: datetime,
     lesson: Lesson,
+    retry: bool = False,
 ) -> tuple[str | None, bool, str | None]:
     """Одна пара за один тік: журнал → щонайбільше одна відмітка → журнал.
     Повертає (підтвердження, чи була відправка, помилка мережі).
@@ -1121,18 +1131,28 @@ def _settle(
     спричинити другий клік. Пара, яку журнал не підтвердив, лишається в
     `sent`, і наступний тік починає з того самого читання журналу:
     самозаліковування є, але його квант — один клік на 30 хвилин.
+
+    `retry` — пара вже в `sent`. Повторний клік тоді дозволений лише проти
+    журналу, який справді прочитався (у ньому є рядки, але не наш): журнал,
+    що не читається, інакше перетворює кожен тік на клік (29.10.2026 — шість
+    «Завантажень» на пару, коли сервер почав вимагати `idUser`).
     """
     sent = False
     try:
-        row = _confirm(client, user, lesson)
-        if row is None and window_is_open(now, lesson):
+        row, readable = _confirm(client, user, lesson)
+        if row is None and retry and not readable and window_is_open(now, lesson):
+            store.log(
+                f"УВАГА: пара {lesson.num_lesson}: журнал не читається — "
+                "повторно не відмічаю; можливо, змінився формат"
+            )
+        elif row is None and window_is_open(now, lesson):
             # `sent` ставимо ДО запиту: якщо POST упаде, невідомо, чи він
             # дійшов, і пара мусить піти в `sent` (§7 спеки). Інакше вона
             # лишалась би `pending`, а успішна відмітка, що все ж
             # зареєструвалась, так і лишилась би невідомою.
             sent = True
             client.check_in(user, lesson)
-            row = _confirm(client, user, lesson)
+            row, _readable = _confirm(client, user, lesson)
     except NetworkError as error:
         return None, sent, str(error)
 
@@ -1297,7 +1317,8 @@ def _run_tick(
     # Обидва списки обробляються однаково: `_settle` сам починає з журналу,
     # тому «перевірити» і «відмітити» — це той самий один клік максимум.
     for lesson in to_verify + to_check_in:
-        confirmed, sent, error = _settle(client, user, store, now, lesson)
+        retry = state.get(lesson.key, PENDING) != PENDING
+        confirmed, sent, error = _settle(client, user, store, now, lesson, retry)
         changed = changed or sent
         if error is not None:
             if sent:
