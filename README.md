@@ -13,27 +13,26 @@
 2. **Termux:Boot** (APK з F-Droid) — щоб демон піднімався після перезавантаження
    телефона. Після встановлення запусти застосунок Termux:Boot **один раз**,
    інакше Android не дозволить йому стартувати.
-3. **Termux:API** (APK з F-Droid) плюс пакет:
-
-   ```
-   pkg install python termux-api
-   ```
-
+3. **Termux:API** (APK з F-Droid).
 4. **Вимкнути оптимізацію батареї для Termux** у налаштуваннях Android.
    Без цього система приспить і задачу сторожа, і сам демон, і жоден варіант
    не працює надійно.
 5. **Дозволити Termux нотифікації** (Apps → Termux → Notifications) — інакше
    `termux-notification` тихо нічого не робить, і про поламку ти не дізнаєшся.
-6. **Файли й розписання:**
+6. **Встановлення — одна команда в Termux:**
 
    ```
-   # скопіювати tt_checkin.py, tick.sh і boot/ у ~/tt-checkin/
-   cd ~/tt-checkin && chmod +x tick.sh boot/tt-checkin.sh
-   mkdir -p ~/.termux/boot && cp boot/tt-checkin.sh ~/.termux/boot/
-   python3 tt_checkin.py login
-   termux-job-scheduler --script ~/tt-checkin/tick.sh \
-       --period-ms 900000 --persisted true
+   curl -fsSL https://raw.githubusercontent.com/GazziKK/tt-checkin/main/install.sh | bash
    ```
+
+   Вона доставить `python` і `termux-api`, завантажить файли в `~/tt-checkin/`,
+   попросить логін і пароль (лише перший раз), поставить сторожа і запустить
+   демона.
+
+## Оновлення
+
+Та сама команда ще раз. Вона зупиняє старого демона, підміняє файли і
+запускає новий; токен, креди і стан у `~/.tt-checkin/` не чіпає.
 
 Далі до телефона можна не повертатись.
 
