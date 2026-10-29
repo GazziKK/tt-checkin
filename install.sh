@@ -44,8 +44,39 @@ chmod +x "$APP/tick.sh" "$APP/boot/tt-checkin.sh"
 cp "$APP/boot/tt-checkin.sh" "$HOME/.termux/boot/"
 
 cd "$APP"
-if [ ! -s "$HOME/.tt-checkin/token" ] && [ ! -s "$HOME/.tt-checkin/credentials" ]; then
-    say "перший запуск: вхід (корпоративна пошта і пароль від розкладу)"
+
+# Код виходу: 0 — токен живий, 1 — мертвий, 2 — мережа недоступна.
+token_alive() {
+    python3 - <<'PY'
+import sys
+from datetime import date
+import tt_checkin as tt
+try:
+    user, _, _ = tt._resolve_access(tt.Client(tt.Store().read_token()), date.today())
+except tt.NetworkError:
+    sys.exit(2)
+sys.exit(0 if user else 1)
+PY
+}
+
+# Креди з `--remember` перелогінюють самі, тому перевіряти є сенс лише токен
+# без кредів: такий міг померти ще на старій версії.
+need_login=""
+if [ ! -s "$HOME/.tt-checkin/credentials" ]; then
+    if [ ! -s "$HOME/.tt-checkin/token" ]; then
+        need_login="перший запуск"
+    else
+        say "перевіряю збережений токен"
+        rc=0; token_alive || rc=$?
+        case $rc in
+            0) echo "токен живий" ;;
+            1) need_login="токен більше не працює" ;;
+            *) echo "мережа недоступна — токен не перевірено, запусти команду ще раз пізніше" ;;
+        esac
+    fi
+fi
+if [ -n "$need_login" ]; then
+    say "$need_login: вхід (корпоративна пошта і пароль від розкладу)"
     # stdin тут — труба від curl, тому логін читає з терміналу напряму.
     python3 tt_checkin.py login --remember < /dev/tty
 fi
